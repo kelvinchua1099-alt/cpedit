@@ -33,6 +33,8 @@ import sys
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
+from typing import List, Optional
+
 from omegaconf import OmegaConf
 from PIL import Image
 
@@ -77,7 +79,7 @@ def run_with_crop(
     src_path:  str,
     tgt_path:  str,
     out_dir:   str,
-    overrides: list | None = None,
+    overrides: Optional[List[str]] = None,
 ) -> dict:
     """
     Run VS3D with crop preprocessing + crop velocity guidance signal.
@@ -112,7 +114,7 @@ def run_without_crop(
     src_path:  str,
     tgt_path:  str,
     out_dir:   str,
-    overrides: list | None = None,
+    overrides: Optional[List[str]] = None,
 ) -> dict:
     """
     Run VS3D without crop preprocessing or crop guidance signal.
