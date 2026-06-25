@@ -1,0 +1,25 @@
+defaults:
+  - base
+
+exp_name: vs3d_full
+
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: true
+  pmg:
+    enabled: true
+    w: 1.2
+    L: 2
+  tar:
+    enabled: true
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  crop:
+    enabled: true
+    padding_scale: 1.5
+    diff_threshold: 15
+    blur_radius: 3
+    guidance_scale: 0.5   # weight for v_tgt(crop) - v_src(crop) extra signal

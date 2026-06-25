@@ -1,0 +1,26 @@
+seed: 42
+device: cuda
+
+model:
+  trellis:
+    ckpt: ${oc.env:CKPT_DIR}/trellis2-o-voxel-4b ##注意这个要自己下载
+    resolution: 1024          # 512 / 1024 / 1536
+  dinov3:
+    ckpt: ${oc.env:CKPT_DIR}/dinov3-vitl16 #这个需要获取权限
+    patch_size: 16
+    layer: -1                 # 取哪一层的 dense feature
+
+solver:
+  type: euler                 # euler / heun
+  num_steps: 30
+  inversion_steps: 30
+
+render:
+  num_views: 8                # 渲染多少个虚拟视角喂 DINO
+  camera: sphere              # 球面均匀采样
+  image_size: 512
+
+output:
+  root: ./outputs
+  save_voxels: true
+  save_renders: true

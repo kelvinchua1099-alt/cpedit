@@ -1,0 +1,22 @@
+defaults:
+  - base
+
+exp_name: vs3d_no_crop
+
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: true
+  pmg:
+    enabled: true
+    w: 1.2
+    L: 2
+  tar:
+    enabled: true
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  crop:
+    enabled: false      # diff_crop_resize is skipped;
+    guidance_scale: 0.0 # no crop velocity signal
