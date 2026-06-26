@@ -146,11 +146,18 @@ class EditPipeline:
         meta["crop_guidance_active"] = crop_conds is not None
 
         # ── Step 4: Stage-1 RASI + PMG ───────────────────────────────────
-        x_src      = self._build_stage1_src_latent(shape_slat_src)
+        # The SS VAE works on a fixed 64³ occupancy grid, but the source
+        # SLAT coords live on a finer cascade grid (≈ res//4). Infer that grid
+        # resolution at runtime so Stage-1 (64³) and Stage-2/3 (source grid)
+        # stay on a consistent lattice.
+        src_grid_res = self._infer_grid_res(shape_slat_src.coords)
+        meta["src_grid_res"] = src_grid_res
+
+        x_src      = self._build_stage1_src_latent(shape_slat_src, src_grid_res)
         z_edit_0   = self.editor.run_stage1(
             x_src, src_cond, tgt_cond, crop_conds=crop_conds
         )
-        coords_tgt = self._decode_stage1_to_coords(z_edit_0)
+        coords_tgt = self._decode_stage1_to_coords(z_edit_0, src_grid_res)
         meta["n_voxels_tgt"] = int(coords_tgt.shape[0])
 
         # ── Step 5: Stage-2/3 TAR ────────────────────────────────────────
@@ -310,51 +317,81 @@ class EditPipeline:
     # Step 4 helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _infer_grid_res(coords: torch.Tensor) -> int:
+        """
+        Infer the integer voxel-grid resolution the SLAT coords live on.
+
+        TRELLIS.2's cascade quantises shape-SLAT coords onto a grid finer than
+        the SS VAE's native 64³ (≈ resolution//4). We round the max coordinate
+        up to the next power of two ≥ 64 so the source occupancy can be
+        rescaled onto the 64³ SS grid without guessing the config.
+        """
+        max_c = int(coords[:, 1:].max().item()) + 1
+        res = _DENSE_SS_RES
+        while res < max_c:
+            res *= 2
+        return res
+
     @torch.no_grad()
-    def _build_stage1_src_latent(self, shape_slat_src: Any) -> torch.Tensor:
+    def _build_stage1_src_latent(
+        self,
+        shape_slat_src: Any,
+        src_grid_res:   int,
+    ) -> torch.Tensor:
         """
         Build x_src for Stage-1 FlowEdit.
 
-        TRELLIS 2.0's sparse_structure_flow_model operates directly on binary
-        occupancy tensors [B, 1, R, R, R] — there is no separate VAE encode step.
-        x_src is the "clean data" at t=0: 1.0 for occupied voxels, 0.0 otherwise.
+        The SS flow model operates in the SS VAE's latent space
+        (z_s ∈ [B, 8, 16, 16, 16]), NOT on raw occupancy. So we:
+          1. scatter the source shape-SLAT coords into a binary occupancy grid,
+             rescaling from their native `src_grid_res` lattice down to the SS
+             VAE's native 64³ input grid;
+          2. encode that occupancy with the SS encoder → x_src latent.
         """
-        R      = _DENSE_SS_RES
+        R      = _DENSE_SS_RES                  # 64³ — SS VAE input resolution
         device = self.device
         coords = shape_slat_src.coords          # [N, 4]  (batch, x, y, z)
         B      = int(coords[:, 0].max().item()) + 1
 
+        scale = R / float(src_grid_res)         # map src grid → 64³
         occ = torch.zeros(B, 1, R, R, R, device=device, dtype=torch.float32)
         b   = coords[:, 0].long()
-        x   = coords[:, 1].long().clamp(0, R - 1)
-        y   = coords[:, 2].long().clamp(0, R - 1)
-        z   = coords[:, 3].long().clamp(0, R - 1)
+        x   = (coords[:, 1].float() * scale).long().clamp(0, R - 1)
+        y   = (coords[:, 2].float() * scale).long().clamp(0, R - 1)
+        z   = (coords[:, 3].float() * scale).long().clamp(0, R - 1)
         occ[b, 0, x, y, z] = 1.0
-        return occ   # [B, 1, R, R, R]
+
+        return self.wrapper.ss_encode(occ)      # [B, 8, 16, 16, 16]
 
     @torch.no_grad()
     def _decode_stage1_to_coords(
         self,
-        z_edit_0:  torch.Tensor,
-        threshold: float = 0.5,
+        z_edit_0:      torch.Tensor,
+        src_grid_res:  int,
     ) -> torch.Tensor:
         """
-        Decode Stage-1 flow output at t=0 → C_tgt coordinate set [N, 4].
+        Decode the edited Stage-1 latent → C_tgt coordinate set [N, 4].
 
-        Tries sparse_structure_decoder first (TRELLIS 2.0 official model key);
-        falls back to direct channel-0 thresholding.
+        Uses the SS decoder (the official model key) to map the 16³×8 latent to
+        a 64³ occupancy, then lifts the active voxels back onto the source's
+        `src_grid_res` lattice so Stage-2/3 TAR can intersect them against the
+        source SLAT coords on a consistent grid.
+
+        Note: this corner-maps each 64³ voxel onto the finer grid, so when
+        src_grid_res > 64 the edited structure is coarser than the source SLAT.
+        Source-residual injection in TAR is therefore exact only on the shared
+        64³-aligned lattice. Both ablation arms share this behaviour identically.
         """
-        decoder = self.wrapper.pipeline.models.get("sparse_structure_decoder")
-        if decoder is not None:
-            try:
-                out = decoder(z_edit_0)
-                if hasattr(out, "coords"):
-                    return out.coords.to(z_edit_0.device)
-            except Exception:
-                pass
-        # Fallback: threshold logit channel 0
-        active = (z_edit_0[:, 0] > threshold).nonzero()   # [N, 4]
-        return active.to(z_edit_0.device)
+        occ    = self.wrapper.ss_decode_occupancy(z_edit_0)   # [B, 1, 64, 64, 64]
+        active = torch.argwhere(occ[:, 0])                    # [N, 4] (b, x, y, z)
+
+        if src_grid_res > _DENSE_SS_RES:
+            factor = src_grid_res // _DENSE_SS_RES
+            active = active.clone()
+            active[:, 1:] = active[:, 1:] * factor            # 64³ → src grid
+
+        return active.to(z_edit_0.device).int()
 
     # ------------------------------------------------------------------
     # Step 7: save outputs

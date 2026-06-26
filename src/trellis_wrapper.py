@@ -96,6 +96,16 @@ class TrellisWrapper:
         self._shape_model = pipeline.models[f"shape_slat_flow_model_{res_key}"]
         self._tex_model   = pipeline.models[f"tex_slat_flow_model_{res_key}"]
 
+        # ── Sparse-Structure VAE ────────────────────────────────────────
+        # The image-to-3D pipeline only *loads* the SS decoder (generation
+        # starts from noise, so no occupancy ever needs encoding). FlowEdit,
+        # however, must encode the SOURCE occupancy into the SS flow-model's
+        # latent space (z_s ∈ [B, 8, 16, 16, 16]) to use it as x_src. We load
+        # the matching SS encoder (the training-time counterpart of the decoder
+        # the pipeline already uses) from the original TRELLIS-1 repo.
+        self.ss_decoder = pipeline.models.get("sparse_structure_decoder")
+        self.ss_encoder = self._load_ss_encoder(cfg)
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -108,6 +118,74 @@ class TrellisWrapper:
         pipeline.to(device)
         pipeline.eval()
         return cls(pipeline, cfg, device)
+
+    # ------------------------------------------------------------------
+    # Sparse-Structure VAE  (encode source occupancy / decode edited latent)
+    # ------------------------------------------------------------------
+
+    # SS VAE native input/output occupancy resolution (16³ latent → 64³ occ).
+    SS_OCC_RES = 64
+
+    @staticmethod
+    def _load_ss_encoder(cfg):
+        """
+        Load the SparseStructureEncoder that matches the pipeline's SS decoder.
+
+        The checkpoint defaults to the original TRELLIS-1 SS VAE
+        (`ss_enc_conv3d_16l8_fp16`: in_channels=1, latent_channels=8) which is
+        the exact training-time counterpart of the SS decoder referenced by
+        TRELLIS.2's pipeline.json. Override with cfg.model.trellis.ss_encoder_ckpt.
+        """
+        from trellis2 import models as t2_models
+
+        ckpt = cfg.model.trellis.get(
+            "ss_encoder_ckpt",
+            "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16",
+        )
+        enc = t2_models.from_pretrained(ckpt)
+        enc.eval()
+        return enc
+
+    @torch.no_grad()
+    def ss_encode(self, occ: torch.Tensor) -> torch.Tensor:
+        """
+        Encode a binary occupancy grid → SS flow-model latent.
+
+        Args:
+            occ : [B, 1, 64, 64, 64] float occupancy (1.0 occupied, 0.0 empty).
+
+        Returns:
+            z_s : [B, 8, 16, 16, 16] latent (posterior mean, deterministic).
+        """
+        enc = self.ss_encoder
+        enc.to(self.device)
+        z = enc(occ.to(self.device))            # sample_posterior=False → mean
+        if self.pipeline.low_vram:
+            enc.cpu()
+        return z
+
+    @torch.no_grad()
+    def ss_decode_occupancy(self, z_s: torch.Tensor) -> torch.Tensor:
+        """
+        Decode an SS latent → binary occupancy at the VAE's native 64³ grid.
+
+        Args:
+            z_s : [B, 8, 16, 16, 16] latent.
+
+        Returns:
+            occ : [B, 1, 64, 64, 64] bool occupancy (decoder logit > 0).
+        """
+        dec = self.ss_decoder
+        if dec is None:
+            raise RuntimeError(
+                "pipeline.models['sparse_structure_decoder'] not loaded — cannot "
+                "decode the Stage-1 latent. Check TRELLIS.2's pipeline.json."
+            )
+        dec.to(self.device)
+        occ = dec(z_s.to(self.device)) > 0      # [B, 1, 64, 64, 64]
+        if self.pipeline.low_vram:
+            dec.cpu()
+        return occ
 
     # ------------------------------------------------------------------
     # Conditioning
