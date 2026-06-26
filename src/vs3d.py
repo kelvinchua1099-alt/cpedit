@@ -389,11 +389,39 @@ class VS3DEditor:
         Returns:
             z_edit at t=0  [B, C, R, R, R]
         """
-        phi_cache: Dict[int, torch.Tensor] = {}
-        if self.enabled_rasi:
-            phi_cache = self._stage1_rasi_phase(x_src, src_cond)
+        # Stage-1 hits the sparse-structure flow model many times via
+        # _dense_cfg_velocity. Under low-VRAM mode TRELLIS.2 keeps models on CPU
+        # until used, so move it to GPU for the whole Stage-1 and restore after
+        # (mirrors sample_sparse_structure's low_vram handling).
+        ss_model = self.wrapper.pipeline.models["sparse_structure_flow_model"]
+        low_vram = bool(getattr(self.wrapper.pipeline, "low_vram", False))
+        if low_vram:
+            ss_model.to(self.device)
 
-        return self._stage1_pmg_phase(x_src, src_cond, tgt_cond, phi_cache, crop_conds)
+        # RASI back-props through the full 1.3B SS flow model; without gradient
+        # checkpointing the retained activations of all transformer blocks blow
+        # past 24 GB. Toggle per-block checkpointing on for Stage-1 and restore.
+        ckpt_blocks = [b for b in getattr(ss_model, "blocks", [])
+                       if hasattr(b, "use_checkpoint")]
+        prev_ckpt = [b.use_checkpoint for b in ckpt_blocks]
+        if self.enabled_rasi:
+            for b in ckpt_blocks:
+                b.use_checkpoint = True
+
+        try:
+            phi_cache: Dict[int, torch.Tensor] = {}
+            if self.enabled_rasi:
+                phi_cache = self._stage1_rasi_phase(x_src, src_cond)
+
+            return self._stage1_pmg_phase(
+                x_src, src_cond, tgt_cond, phi_cache, crop_conds
+            )
+        finally:
+            for b, p in zip(ckpt_blocks, prev_ckpt):
+                b.use_checkpoint = p
+            if low_vram:
+                ss_model.cpu()
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # TAR helpers: coordinate intersection  (vectorised)
@@ -509,10 +537,16 @@ class VS3DEditor:
         device = self.device
 
         # --- Build initial noise on C_tgt ---
+        # Noise lives in the *latent* (output) space of the flow model. For the
+        # texture stage the model's in_channels already bundles the concatenated
+        # shape latent (in = tex_latent + shape_latent), so sizing noise by
+        # in_channels would double-count it once concat_cond is added in forward.
+        # Use out_channels (the pure latent dim) for both stages.
         n_tgt = coords_tgt.shape[0]
-        in_ch = (self.wrapper.shape_in_channels if model == "shape"
-                 else self.wrapper.tex_in_channels)
+        in_ch = (self.wrapper.shape_latent_channels if model == "shape"
+                 else self.wrapper.tex_latent_channels)
         noise_feats = torch.randn(n_tgt, in_ch, device=device, dtype=torch.float32)
+        coords_tgt  = coords_tgt.contiguous()   # flex_gemm sparse conv requires it
         init_noise  = SparseTensor(coords=coords_tgt, feats=noise_feats)
 
         # --- Native target forward  (eq. 10 left) ---

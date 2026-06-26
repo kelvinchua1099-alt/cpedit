@@ -19,7 +19,9 @@ editing:
     theta: 0.7
   crop:
     enabled: true
-    padding_scale: 1.5
-    diff_threshold: 15
+    padding_scale: 1.2      # tighter than 1.5 so a localized bbox stays localized
+    diff_threshold: 40      # higher → ignore anti-aliasing / render noise
     blur_radius: 3
+    open_iter: 4            # morphological opening to despeckle edge noise
+    keep_frac: 0.15         # drop connected components < 15% of the largest
     guidance_scale: 0.5   # weight for v_tgt(crop) - v_src(crop) extra signal

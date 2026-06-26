@@ -14,11 +14,37 @@ from typing import Dict, Tuple
 
 import numpy as np
 from PIL import Image, ImageFilter
+from scipy import ndimage
 
 
 # ---------------------------------------------------------------------------
 # Internal helper
 # ---------------------------------------------------------------------------
+
+def _clean_mask(mask: np.ndarray, open_iter: int, keep_frac: float) -> np.ndarray:
+    """
+    Despeckle a raw diff mask so the bbox tracks the real edit region.
+
+    High-contrast renders produce scattered high-diff pixels along
+    anti-aliased edges across the *whole* frame; a few outliers stretch the
+    global bbox to cover everything. We:
+      1. morphological opening — erode away thin edge noise (anti-aliasing),
+         keep solid blobs (the actual added/changed object);
+      2. keep only connected components whose area is ≥ keep_frac × the
+         largest component, dropping isolated specks.
+    """
+    if open_iter > 0:
+        opened = ndimage.binary_opening(mask, iterations=open_iter)
+        if opened.any():
+            mask = opened   # fall back to raw mask if opening erased everything
+
+    lbl, n = ndimage.label(mask)
+    if n <= 1:
+        return mask
+    sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
+    keep_labels = np.where(sizes >= keep_frac * sizes.max())[0] + 1
+    return np.isin(lbl, keep_labels)
+
 
 def _shift_bbox_into_image(
     x1: float, y1: float, x2: float, y2: float, W: int, H: int
@@ -55,6 +81,8 @@ def diff_crop_resize(
     padding_scale: float = 1.5,
     diff_threshold: int = 15,
     blur_radius: int = 3,
+    open_iter: int = 3,
+    keep_frac: float = 0.15,
 ) -> Tuple[Image.Image, Image.Image, Dict]:
     """
     通过逐像素相减定位两张图片的修改区域，裁剪出该区域并 resize 回原图尺寸。
@@ -104,6 +132,10 @@ def diff_crop_resize(
     if blur_radius > 0:
         diff_pil = diff_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     mask = np.array(diff_pil) > diff_threshold   # [H,W] bool
+
+    # ── 2b. 去散点噪声：形态学开运算 + 最大连通块 ───────────────────────
+    if mask.any():
+        mask = _clean_mask(mask, open_iter=open_iter, keep_frac=keep_frac)
 
     # ── 3. 无变化区域：直接返回原图 ──────────────────────────────────────
     ys, xs = np.where(mask)

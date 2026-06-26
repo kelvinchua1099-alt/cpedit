@@ -116,7 +116,11 @@ class TrellisWrapper:
         device   = torch.device(cfg.device)
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(cfg.model.trellis.ckpt)
         pipeline.to(device)
-        pipeline.eval()
+        # Trellis2ImageTo3DPipeline has no .eval(); set its sub-models to eval mode
+        # individually (low-VRAM mode keeps them on CPU until used).
+        for _m in pipeline.models.values():
+            if hasattr(_m, "eval"):
+                _m.eval()
         return cls(pipeline, cfg, device)
 
     # ------------------------------------------------------------------
@@ -414,3 +418,13 @@ class TrellisWrapper:
     @property
     def tex_in_channels(self) -> int:
         return self._tex_model.in_channels
+
+    @property
+    def shape_latent_channels(self) -> int:
+        """Pure shape-latent dim (flow out_channels) — the size of the noise."""
+        return self._shape_model.out_channels
+
+    @property
+    def tex_latent_channels(self) -> int:
+        """Pure texture-latent dim (flow out_channels), excluding concat shape."""
+        return self._tex_model.out_channels

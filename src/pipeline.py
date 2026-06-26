@@ -271,6 +271,8 @@ class EditPipeline:
             padding_scale  = float(crop_cfg.get("padding_scale",  1.5)),
             diff_threshold = int(crop_cfg.get("diff_threshold",   15)),
             blur_radius    = int(crop_cfg.get("blur_radius",       3)),
+            open_iter      = int(crop_cfg.get("open_iter",         3)),
+            keep_frac      = float(crop_cfg.get("keep_frac",     0.15)),
         )
 
     # ------------------------------------------------------------------
@@ -391,7 +393,8 @@ class EditPipeline:
             active = active.clone()
             active[:, 1:] = active[:, 1:] * factor            # 64³ → src grid
 
-        return active.to(z_edit_0.device).int()
+        # flex_gemm's sparse conv requires contiguous coords.
+        return active.to(z_edit_0.device).int().contiguous()
 
     # ------------------------------------------------------------------
     # Step 7: save outputs
