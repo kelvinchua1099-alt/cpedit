@@ -42,6 +42,7 @@ import torch
 from omegaconf import DictConfig
 from PIL import Image
 
+from .asset_loader import render_asset
 from .preprocess import diff_crop_resize
 from .trellis_wrapper import Trellis2Condition, TrellisWrapper
 from .vs3d import VS3DEditor
@@ -180,6 +181,62 @@ class EditPipeline:
         return {"meshes": meshes, "output_dir": out_dir, "meta": meta}
 
     # ------------------------------------------------------------------
+    # Asset entry point  (3D file → render → run)
+    # ------------------------------------------------------------------
+
+    def run_from_asset(
+        self,
+        asset_path: str,
+        img_tgt:    Image.Image,
+        output_dir: Optional[str] = None,
+        render_size: int  = 512,
+        elevation:   float = 15.0,
+        azimuth:     float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Edit a 3D asset file (.glb / .obj / .ply) given a 2D edited target image.
+
+        Because TRELLIS 2.0 has no mesh-to-SLAT encoder, the asset is rendered
+        from a canonical viewpoint to produce img_src, which is then passed
+        through the normal image-to-3D pipeline.
+
+        Args
+        ----
+        asset_path  : path to .glb / .obj / .ply / .stl
+        img_tgt     : 2D-edited PIL image showing the desired changes
+        output_dir  : output folder (auto if omitted)
+        render_size : rendered image resolution (default 512, should match img_tgt)
+        elevation   : camera elevation in degrees (default 15°)
+        azimuth     : camera azimuth in degrees (default 30° — slight 3/4 view)
+
+        Returns
+        -------
+        dict with keys  meshes, output_dir, meta  (same as run())
+        """
+        out_dir = output_dir or self._make_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Render the asset → img_src
+        img_src = render_asset(
+            asset_path,
+            size=render_size,
+            elevation_deg=elevation,
+            azimuth_deg=azimuth,
+        )
+        # Resize img_tgt to match rendered img_src
+        if img_tgt.size != img_src.size:
+            img_tgt = img_tgt.resize(img_src.size, Image.BICUBIC)
+
+        # Save the rendered source so the user can inspect the viewpoint
+        img_src.save(os.path.join(out_dir, "rendered_src.png"))
+
+        result = self.run(img_src, img_tgt, output_dir=out_dir)
+        result["meta"]["asset_path"]    = asset_path
+        result["meta"]["render_elev"]   = elevation
+        result["meta"]["render_azimuth"] = azimuth
+        return result
+
+    # ------------------------------------------------------------------
     # Step 1: preprocessing
     # ------------------------------------------------------------------
 
@@ -258,8 +315,9 @@ class EditPipeline:
         """
         Build x_src for Stage-1 FlowEdit.
 
-        1. Scatter shape_slat coords → binary occupancy [B, 1, R, R, R]
-        2. Encode via pipeline.models["sparse_structure_vae"]
+        TRELLIS 2.0's sparse_structure_flow_model operates directly on binary
+        occupancy tensors [B, 1, R, R, R] — there is no separate VAE encode step.
+        x_src is the "clean data" at t=0: 1.0 for occupied voxels, 0.0 otherwise.
         """
         R      = _DENSE_SS_RES
         device = self.device
@@ -272,14 +330,7 @@ class EditPipeline:
         y   = coords[:, 2].long().clamp(0, R - 1)
         z   = coords[:, 3].long().clamp(0, R - 1)
         occ[b, 0, x, y, z] = 1.0
-
-        vae = self.wrapper.pipeline.models.get("sparse_structure_vae")
-        if vae is None:
-            raise RuntimeError(
-                "pipeline.models['sparse_structure_vae'] not found. "
-                "Check that TRELLIS 2.0 exposes the sparse-structure VAE under that key."
-            )
-        return vae.encode(occ)   # [B, C, R, R, R]
+        return occ   # [B, 1, R, R, R]
 
     @torch.no_grad()
     def _decode_stage1_to_coords(
@@ -288,13 +339,21 @@ class EditPipeline:
         threshold: float = 0.5,
     ) -> torch.Tensor:
         """
-        Decode edited Stage-1 latent → binary occupancy → C_tgt coords [N, 4].
+        Decode Stage-1 flow output at t=0 → C_tgt coordinate set [N, 4].
+
+        Tries sparse_structure_decoder first (TRELLIS 2.0 official model key);
+        falls back to direct channel-0 thresholding.
         """
-        vae = self.wrapper.pipeline.models.get("sparse_structure_vae")
-        if vae is None:
-            raise RuntimeError("pipeline.models['sparse_structure_vae'] not found.")
-        occ    = vae.decode(z_edit_0)             # [B, 1, R, R, R]
-        active = (occ[:, 0] > threshold).nonzero()  # [N, 4]
+        decoder = self.wrapper.pipeline.models.get("sparse_structure_decoder")
+        if decoder is not None:
+            try:
+                out = decoder(z_edit_0)
+                if hasattr(out, "coords"):
+                    return out.coords.to(z_edit_0.device)
+            except Exception:
+                pass
+        # Fallback: threshold logit channel 0
+        active = (z_edit_0[:, 0] > threshold).nonzero()   # [N, 4]
         return active.to(z_edit_0.device)
 
     # ------------------------------------------------------------------

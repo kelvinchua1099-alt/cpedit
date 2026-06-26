@@ -1,39 +1,41 @@
 """
-run_vs3d.py — run the VS3D editing pipeline.
+run_vs3d.py — VS3D editing pipeline entry point.
 
-两种使用方式
------------
-1. 带 crop（推荐，利用额外的 crop 引导信号）:
-   python scripts/run_vs3d.py \\
-       --src  data/kirby.png \\
-       --tgt  data/kirby_edited.png \\
-       --out  outputs/with_crop
+主要接口：从 3D 资产文件 (.glb/.obj/.ply) 直接编辑
+---------------------------------------------------
+  python scripts/run_vs3d.py \\
+      --asset  data/chair.glb \\
+      --tgt    data/chair_redpaint.png \\
+      --out    outputs/chair_edit
 
-2. 不带 crop（消融对比）:
-   python scripts/run_vs3d.py \\
-       --src  data/kirby.png \\
-       --tgt  data/kirby_edited.png \\
-       --out  outputs/no_crop \\
-       --no-crop
+管线会自动把 .glb 渲染成一张参考图（输出到 rendered_src.png），
+然后用这张图 + 编辑图走完 VS3D 流程。
 
-Config 加载顺序:  base.yaml  →  full.yaml / no_crop.yaml  →  命令行 overrides (--set)
+备用接口：直接提供参考图（跳过渲染）
+--------------------------------------
+  python scripts/run_vs3d.py \\
+      --src  data/chair_photo.png \\
+      --tgt  data/chair_redpaint.png \\
+      --out  outputs/chair_edit
 
-示例
+开关
 ----
-# 修改 guidance_scale 而不改 yaml:
-python scripts/run_vs3d.py --src a.png --tgt b.png --set editing.crop.guidance_scale=0.8
+  --no-crop      关闭 diff-crop 预处理和 crop 引导信号（消融对比用）
+  --elev FLOAT   渲染仰角，默认 15°
+  --azim FLOAT   渲染方位角，默认 30°（3/4 侧视）
+  --set K=V      覆盖 config 值，如 --set editing.crop.guidance_scale=0.8
+
+Config 加载：base.yaml → full.yaml (有 crop) / no_crop.yaml (无 crop) → --set 覆盖
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+from typing import List, Optional
 
-# 把 TrellisCropEdit 根目录加入路径，使 src.* 可以 import
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-
-from typing import List, Optional
 
 from omegaconf import OmegaConf
 from PIL import Image
@@ -42,37 +44,64 @@ from src.pipeline import EditPipeline
 
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# Config loading
 # ---------------------------------------------------------------------------
 
-def _load_cfg(config_name: str, overrides: list):
-    """
-    Load base.yaml, then merge config_name.yaml on top, then apply
-    any dot-notation overrides from the command line.
-
-    config_name: "full" or "no_crop" (filename without .yaml)
-    overrides:   list of "key=value" strings  e.g. ["editing.crop.guidance_scale=0.8"]
-    """
+def _load_cfg(config_name: str, overrides: List[str]):
     cfg_dir  = os.path.join(_ROOT, "configs")
     base_cfg = OmegaConf.load(os.path.join(cfg_dir, "base.yaml"))
     exp_cfg  = OmegaConf.load(os.path.join(cfg_dir, f"{config_name}.yaml"))
 
-    # Drop the Hydra 'defaults' key before merging
     if "defaults" in exp_cfg:
         exp_cfg = OmegaConf.masked_copy(
             exp_cfg, [k for k in exp_cfg if k != "defaults"]
         )
 
     cfg = OmegaConf.merge(base_cfg, exp_cfg)
-
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
-
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Setting A: with crop
+# Primary: from 3D asset file
+# ---------------------------------------------------------------------------
+
+def run_from_asset(
+    asset_path: str,
+    tgt_path:   str,
+    out_dir:    str,
+    no_crop:    bool = False,
+    elevation:  float = 15.0,
+    azimuth:    float = 30.0,
+    overrides:  Optional[List[str]] = None,
+) -> dict:
+    """
+    从 .glb/.obj/.ply 3D 资产文件开始编辑。
+
+    资产会被渲染成参考图（rendered_src.png 保存到输出目录），
+    然后走完和 run_with_crop / run_without_crop 完全一样的 VS3D 流程。
+    """
+    cfg_name = "no_crop" if no_crop else "full"
+    cfg      = _load_cfg(cfg_name, overrides or [])
+
+    print(f"[asset]  {asset_path}  elev={elevation}°  azim={azimuth}°")
+    print(f"[asset]  crop={'off' if no_crop else 'on'}  out → {out_dir}")
+
+    pipeline = EditPipeline.from_config(cfg)
+    result   = pipeline.run_from_asset(
+        asset_path  = asset_path,
+        img_tgt     = Image.open(tgt_path).convert("RGB"),
+        output_dir  = out_dir,
+        elevation   = elevation,
+        azimuth     = azimuth,
+    )
+    _print_summary(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Secondary: from source image (backward-compatible)
 # ---------------------------------------------------------------------------
 
 def run_with_crop(
@@ -81,21 +110,9 @@ def run_with_crop(
     out_dir:   str,
     overrides: Optional[List[str]] = None,
 ) -> dict:
-    """
-    Run VS3D with crop preprocessing + crop velocity guidance signal.
-
-    Stage-1 velocity update per noise draw:
-        v_Δ = [v(z | c_tgt_full) − v(z | c_src_full)]
-            + guidance_scale × [v(z | c_tgt_crop) − v(z | c_src_crop)]
-
-    The second term amplifies the edit signal inside the detected region
-    and is zero outside it (because c_tgt_crop ≈ c_src_crop outside the diff).
-    PMG then extrapolates the combined signal.
-    """
+    """全图条件 + crop 引导信号（推荐）。"""
     cfg = _load_cfg("full", overrides or [])
-    print(f"[with_crop]  guidance_scale={cfg.editing.crop.guidance_scale}  "
-          f"out → {out_dir}")
-
+    print(f"[img/with_crop]  guidance_scale={cfg.editing.crop.guidance_scale}  out → {out_dir}")
     pipeline = EditPipeline.from_config(cfg)
     result   = pipeline.run(
         Image.open(src_path).convert("RGB"),
@@ -105,10 +122,6 @@ def run_with_crop(
     _print_summary(result)
     return result
 
-
-# ---------------------------------------------------------------------------
-# Setting B: without crop
-# ---------------------------------------------------------------------------
 
 def run_without_crop(
     src_path:  str,
@@ -116,17 +129,9 @@ def run_without_crop(
     out_dir:   str,
     overrides: Optional[List[str]] = None,
 ) -> dict:
-    """
-    Run VS3D without crop preprocessing or crop guidance signal.
-
-    Stage-1 velocity update per noise draw:
-        v_Δ = v(z | c_tgt_full) − v(z | c_src_full)
-
-    RASI, PMG, TAR remain active; only the crop extra signal is absent.
-    """
+    """仅全图条件，无 crop 信号（消融对比）。"""
     cfg = _load_cfg("no_crop", overrides or [])
-    print(f"[no_crop]    crop disabled  out → {out_dir}")
-
+    print(f"[img/no_crop]  crop disabled  out → {out_dir}")
     pipeline = EditPipeline.from_config(cfg)
     result   = pipeline.run(
         Image.open(src_path).convert("RGB"),
@@ -138,21 +143,25 @@ def run_without_crop(
 
 
 # ---------------------------------------------------------------------------
-# Summary
+# Summary printer
 # ---------------------------------------------------------------------------
 
 def _print_summary(result: dict) -> None:
     meta = result.get("meta", {})
-    print("─" * 52)
+    print("─" * 56)
     print(f"  output dir     : {result['output_dir']}")
+    if "asset_path" in meta:
+        print(f"  source asset   : {meta['asset_path']}")
     print(f"  voxels (C_tgt) : {meta.get('n_voxels_tgt', '?')}")
     print(f"  crop active    : {meta.get('crop_guidance_active', False)}")
     crop = meta.get("crop", {})
     if crop.get("found_change"):
         print(f"  crop bbox      : {crop.get('bbox_crop')}")
     for p in meta.get("glb_paths", []):
-        print(f"  saved          : {p}")
-    print("─" * 52)
+        print(f"  saved GLB      : {p}")
+    if os.path.exists(os.path.join(result["output_dir"], "rendered_src.png")):
+        print(f"  rendered src   : {result['output_dir']}/rendered_src.png")
+    print("─" * 56)
 
 
 # ---------------------------------------------------------------------------
@@ -161,28 +170,55 @@ def _print_summary(result: dict) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="VS3D 3D asset editing  (with or without crop guidance)",
+        description="VS3D 3D asset editing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--src",     required=True,  help="Source (reference) image")
-    p.add_argument("--tgt",     required=True,  help="Edited target image")
-    p.add_argument("--out",     default=None,   help="Output directory (auto if omitted)")
-    p.add_argument("--no-crop", action="store_true",
-                   help="Disable crop preprocessing and crop guidance signal")
-    p.add_argument("--set",     nargs="*", default=[], metavar="KEY=VALUE",
-                   help="Config overrides, e.g. --set editing.crop.guidance_scale=0.8")
+
+    src_group = p.add_mutually_exclusive_group(required=True)
+    src_group.add_argument(
+        "--asset", metavar="FILE",
+        help="[主要] 3D 资产文件路径 (.glb / .obj / .ply / .stl)"
+    )
+    src_group.add_argument(
+        "--src", metavar="IMG",
+        help="[备用] 源参考图路径（跳过 3D 渲染）"
+    )
+
+    p.add_argument("--tgt",      required=True,  metavar="IMG",
+                   help="2D 编辑目标图路径")
+    p.add_argument("--out",      default=None,   metavar="DIR",
+                   help="输出目录（不填则自动生成）")
+    p.add_argument("--no-crop",  action="store_true",
+                   help="关闭 diff-crop 预处理和 crop 引导信号")
+    p.add_argument("--elev",     type=float, default=15.0, metavar="DEG",
+                   help="渲染仰角（仅 --asset 模式，默认 15°）")
+    p.add_argument("--azim",     type=float, default=30.0, metavar="DEG",
+                   help="渲染方位角（仅 --asset 模式，默认 30°）")
+    p.add_argument("--set",      nargs="*", default=[], metavar="KEY=VALUE",
+                   help="Config 覆盖，如 --set editing.crop.guidance_scale=0.8")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    src_stem = os.path.splitext(os.path.basename(args.src))[0]
-    mode     = "no_crop" if args.no_crop else "with_crop"
-    out_dir  = args.out or os.path.join("outputs", f"{src_stem}_{mode}")
+    # Auto output dir
+    stem    = os.path.splitext(os.path.basename(args.asset or args.src))[0]
+    mode    = "no_crop" if args.no_crop else "with_crop"
+    out_dir = args.out or os.path.join("outputs", f"{stem}_{mode}")
 
-    if args.no_crop:
+    if args.asset:
+        run_from_asset(
+            asset_path = args.asset,
+            tgt_path   = args.tgt,
+            out_dir    = out_dir,
+            no_crop    = args.no_crop,
+            elevation  = args.elev,
+            azimuth    = args.azim,
+            overrides  = args.set,
+        )
+    elif args.no_crop:
         run_without_crop(args.src, args.tgt, out_dir, args.set)
     else:
         run_with_crop(args.src, args.tgt, out_dir, args.set)
