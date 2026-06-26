@@ -32,13 +32,21 @@ from .trellis_wrapper import Trellis2Condition, TrellisWrapper
 class VS3DHyperparams:
     # Stage-1 schedule
     num_steps: int   = 25
-    n_max:     int   = 12    # last active step index (0-indexed from t=1 end)
-    n_min:     int   = 0     # first active step index
+    n_max:     int   = 12    # (legacy, unused) last active step index
+    n_min:     int   = 0     # (legacy, unused) first active step index
+    # FlowEdit edits the LATE (low-noise) steps only: skip the first st_step
+    # high-noise steps and edit the rest (matches Nano3D inference/sampling.py:
+    # `if num_st < st_step: continue`). Editing the early high-noise steps
+    # instead rewrites the global structure and scrambles the object.
+    st_step:   int   = 12
 
-    # CFG weights (paper notation ω; wrapper uses guidance_strength = 1+ω)
-    omega_src:  float = 1.5
-    omega_tgt:  float = 9.0
-    cfg_t_min:  float = 0.6  # CFG is on only for t ∈ [cfg_t_min, 1.0]
+    # CFG weights. Nano3D uses cfg_strength directly; cpedit's CFG is
+    # (1+ω)·v_cond − ω·v_phi, so cfg_strength = 1+ω. Nano3D defaults
+    # tar_cfg=5.5, src_cfg=1.5  →  ω_tgt=4.5, ω_src=0.5. CFG is applied over the
+    # full t-range (Nano3D cfg_interval=(0,1)), so cfg_t_min=0.
+    omega_src:  float = 0.5
+    omega_tgt:  float = 4.5
+    cfg_t_min:  float = 0.0  # CFG on for all t ∈ [cfg_t_min, 1.0]
 
     # Monte-Carlo noise budget
     S: int = 5               # total noise samples per step
@@ -108,9 +116,10 @@ class VS3DEditor:
             num_steps   = cfg.solver.get("num_steps", 25),
             n_max       = ec.get("n_max", 12),
             n_min       = ec.get("n_min", 0),
-            omega_src   = ec.get("omega_src", 1.5),
-            omega_tgt   = ec.get("omega_tgt", 9.0),
-            cfg_t_min   = ec.get("cfg_t_min", 0.6),
+            st_step     = ec.get("st_step", 12),
+            omega_src   = ec.get("omega_src", 0.5),
+            omega_tgt   = ec.get("omega_tgt", 4.5),
+            cfg_t_min   = ec.get("cfg_t_min", 0.0),
             S           = ec.get("noise_samples", 5),
             pmg_w       = ec.pmg.get("w", 1.2)         if hasattr(ec, "pmg")  else 1.2,
             pmg_L       = ec.pmg.get("L", 2)           if hasattr(ec, "pmg")  else 2,
@@ -140,9 +149,16 @@ class VS3DEditor:
         return [(1.0 - k / T, 1.0 - (k + 1) / T) for k in range(T)]
 
     def _active_schedule(self) -> List[Tuple[float, float]]:
-        """Active (t_curr, t_next) pairs: steps n_min..n_max (0-indexed from t=1)."""
+        """
+        Active (t_curr, t_next) pairs — the LATE, low-noise steps only.
+
+        Nano3D skips the first `st_step` high-noise steps and edits the rest
+        (inference/sampling.py: `if num_st < st_step: continue`). st_step is
+        clamped below num_steps so at least one step is always edited.
+        """
         sched = self._full_schedule()
-        return sched[self.hp.n_min : self.hp.n_max + 1]
+        st = max(0, min(self.hp.st_step, len(sched) - 1))
+        return sched[st:]
 
     # ------------------------------------------------------------------
     # FlowEdit coupling  (eq. 3)

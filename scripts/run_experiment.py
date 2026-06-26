@@ -51,10 +51,15 @@ def main():
     ap.add_argument("--modes", nargs="+", default=["full", "no_crop"])
     ap.add_argument("--src_name", default="source.png")
     ap.add_argument("--tgt_name", default="edit_512.png")
+    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="dot-notation config overrides applied to every mode")
     args = ap.parse_args()
 
     os.makedirs(args.results_root, exist_ok=True)
     cfgs = {m: load_cfg(m) for m in args.modes}
+    if args.set:
+        ov = OmegaConf.from_dotlist(args.set)
+        cfgs = {m: OmegaConf.merge(c, ov) for m, c in cfgs.items()}
 
     # Shared backbone — built once from the first mode's config (model section is
     # identical across modes; only editing.* differs).

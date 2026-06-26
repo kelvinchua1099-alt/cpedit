@@ -95,7 +95,9 @@ def render_views(mesh_path: str, size: int = RENDER_SIZE):
         scene.add(pyrender.PerspectiveCamera(yfov=np.pi / 4.0), pose=pose)
         scene.add(pyrender.DirectionalLight(color=[1, 1, 1], intensity=3.0), pose=pose)
         color, _ = renderer.render(scene)
-        imgs.append(np.asarray(color, dtype=np.uint8))
+        # pyrender may return a flipped view (negative strides); torch.from_numpy
+        # and several ops need a contiguous copy.
+        imgs.append(np.ascontiguousarray(color, dtype=np.uint8))
     renderer.delete()
     return imgs
 
@@ -110,11 +112,13 @@ class Metrics:
         import lpips
         self.lpips = lpips.LPIPS(net="alex").to(self.device).eval()
         import open_clip
+        # OpenAI CLIP ViT-B/32 uses QuickGELU; the plain "ViT-B-32" arch defaults
+        # to nn.GELU and warns/degrades with the openai weights.
         self.clip, _, self.clip_pre = open_clip.create_model_and_transforms(
-            "ViT-B-32", pretrained="openai"
+            "ViT-B-32-quickgelu", pretrained="openai"
         )
         self.clip = self.clip.to(self.device).eval()
-        self.clip_tok = open_clip.get_tokenizer("ViT-B-32")
+        self.clip_tok = open_clip.get_tokenizer("ViT-B-32-quickgelu")
 
     @staticmethod
     def _to_lpips(img: np.ndarray) -> torch.Tensor:
@@ -184,13 +188,16 @@ def find_pred_glb(mode_dir: str) -> str | None:
     return None
 
 
-def run_mode(metrics: Metrics, results_root: str, data_root: str, mode: str):
+def run_mode(metrics: Metrics, results_root: str, data_root: str, mode: str,
+             only_uids=None):
     mode_root = os.path.join(results_root, mode)
     per_item, failures = {}, []
     if not os.path.isdir(mode_root):
         return {"per_item": {}, "aggregate": aggregate({}), "failures": []}, []
 
     for uid in sorted(os.listdir(mode_root)):
+        if only_uids and uid not in only_uids:
+            continue
         mode_dir = os.path.join(mode_root, uid)
         if not os.path.isdir(mode_dir):
             continue
@@ -217,21 +224,28 @@ def main():
     ap.add_argument("--results_root", default="results")
     ap.add_argument("--data_root", default="data/nano3d")
     ap.add_argument("--modes", nargs="+", default=["full", "no_crop"])
+    ap.add_argument("--device", default="cuda", help="cuda or cpu (cpu avoids "
+                    "GPU contention with a running experiment)")
+    ap.add_argument("--uids", nargs="*", default=None,
+                    help="restrict to these uids (default: all)")
+    ap.add_argument("--out_suffix", default="",
+                    help="suffix for metrics_*.json (e.g. _partial)")
     args = ap.parse_args()
 
-    metrics = Metrics()
+    metrics = Metrics(device=args.device)
     all_results = {}
     for mode in args.modes:
-        res, fails = run_mode(metrics, args.results_root, args.data_root, mode)
+        res, fails = run_mode(metrics, args.results_root, args.data_root, mode,
+                              only_uids=args.uids)
         all_results[mode] = res
-        out = os.path.join(args.results_root, f"metrics_{mode}.json")
+        out = os.path.join(args.results_root, f"metrics_{mode}{args.out_suffix}.json")
         with open(out, "w") as f:
             json.dump(res, f, indent=2)
         print(f"wrote {out}  ({len(res['per_item'])} ok, {len(fails)} failed)")
 
     # comparison CSV
     keys = ["psnr", "ssim", "lpips", "clip_sim", "identity_lpips"]
-    csv_path = os.path.join(args.results_root, "metrics_comparison.csv")
+    csv_path = os.path.join(args.results_root, f"metrics_comparison{args.out_suffix}.csv")
     with open(csv_path, "w") as f:
         f.write("metric," + ",".join(f"{m}_mean,{m}_std" for m in args.modes) + "\n")
         for k in keys:
