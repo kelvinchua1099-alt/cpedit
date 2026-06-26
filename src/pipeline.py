@@ -407,7 +407,7 @@ class EditPipeline:
 
         for i, mesh in enumerate(meshes):
             glb_path = os.path.join(out_dir, f"result_{i:02d}.glb")
-            mesh.export(glb_path)
+            self._export_glb(mesh, glb_path)
             meta.setdefault("glb_paths", []).append(glb_path)
 
             if save_renders:
@@ -419,6 +419,35 @@ class EditPipeline:
 
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:
             json.dump(_jsonable(meta), f, indent=2)
+
+    @staticmethod
+    def _export_glb(mesh: Any, glb_path: str) -> None:
+        """
+        Export a decoded MeshWithVoxel to a textured GLB.
+
+        TRELLIS.2 has no MeshWithVoxel.export(); GLB extraction goes through
+        o_voxel.postprocess.to_glb (remesh + decimate + UV + bake), exactly as
+        in TRELLIS.2/example.py. mesh.save() only writes .ply/.npz/.vxz, not GLB.
+        """
+        import o_voxel
+
+        mesh.simplify(16777216)   # nvdiffrast triangle-count limit
+        glb = o_voxel.postprocess.to_glb(
+            vertices          = mesh.vertices,
+            faces             = mesh.faces,
+            attr_volume       = mesh.attrs,
+            coords            = mesh.coords,
+            attr_layout       = mesh.layout,
+            voxel_size        = mesh.voxel_size,
+            aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target = 1000000,
+            texture_size      = 2048,
+            remesh            = True,
+            remesh_band       = 1,
+            remesh_project    = 0,
+            verbose           = False,
+        )
+        glb.export(glb_path, extension_webp=True)
 
     def _render_views(self, mesh: Any) -> List[Image.Image]:
         num_views  = int(self.cfg.render.get("num_views", 8))
