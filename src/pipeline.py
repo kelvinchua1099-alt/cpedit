@@ -153,9 +153,33 @@ class EditPipeline:
         src_grid_res = self._infer_grid_res(shape_slat_src.coords)
         meta["src_grid_res"] = src_grid_res
 
-        x_src      = self._build_stage1_src_latent(shape_slat_src, src_grid_res)
+        x_src = self._build_stage1_src_latent(shape_slat_src, src_grid_res)
+
+        # ── Step 4b: automatic edit-region mask (B1 latent-delta) ────────
+        mask_cfg   = self.cfg.editing.get("mask", {})
+        use_mask   = bool(mask_cfg.get("enabled", False))
+        M_latent   = None
+        masked_st  = None
+        if use_mask:
+            from .mask import build_latent_delta_mask
+            probe_st  = mask_cfg.get("probe_st_step", None)
+            masked_st = mask_cfg.get("masked_st_step", None)
+            z_probe   = self.editor.probe_global_stage1(
+                x_src, src_cond, tgt_cond, st_step=probe_st
+            )
+            M_latent = build_latent_delta_mask(
+                z_probe, x_src,
+                threshold = float(mask_cfg.get("threshold", 0.25)),
+                dilate    = int(mask_cfg.get("dilate", 1)),
+                feather   = float(mask_cfg.get("feather", 1.0)),
+            )
+            meta["mask_active"]   = True
+            meta["mask_frac"]     = float((M_latent > 0.5).float().mean().item())
+            meta["masked_st_step"] = masked_st
+
         z_edit_0   = self.editor.run_stage1(
-            x_src, src_cond, tgt_cond, crop_conds=crop_conds
+            x_src, src_cond, tgt_cond, crop_conds=crop_conds,
+            mask=M_latent, st_step_override=masked_st,
         )
         coords_tgt = self._decode_stage1_to_coords(z_edit_0, src_grid_res)
         meta["n_voxels_tgt"] = int(coords_tgt.shape[0])
@@ -167,6 +191,11 @@ class EditPipeline:
         num_steps = int(self.cfg.solver.get("num_steps", 25))
         guidance  = 1.0 + self.editor.hp.omega_tgt
 
+        mask_at_coords = None
+        if use_mask and bool(mask_cfg.get("gate_tar", True)):
+            from .mask import sample_mask_at_coords
+            mask_at_coords = sample_mask_at_coords(M_latent, coords_tgt, src_grid_res)
+
         z_shape_edit, z_tex_edit = self.editor.edit_sparse_stages(
             z_src_shape_enc=z_src_shape,
             z_src_tex_enc=z_src_tex,
@@ -175,6 +204,7 @@ class EditPipeline:
             coords_tgt=coords_tgt,
             num_steps=num_steps,
             guidance=guidance,
+            mask_at_coords=mask_at_coords,
         )
 
         # ── Step 6: decode to 3D ─────────────────────────────────────────

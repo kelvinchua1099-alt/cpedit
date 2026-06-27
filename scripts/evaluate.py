@@ -144,7 +144,7 @@ class Metrics:
 # ---------------------------------------------------------------------------
 
 def eval_object(metrics: Metrics, pred_glb: str, gt_glb: str, src_glb: str,
-                tgt_img_path: str) -> dict:
+                tgt_img_path: str, src_img_path: str | None = None) -> dict:
     pred = render_views(pred_glb)
     gt = render_views(gt_glb)
     src = render_views(src_glb)
@@ -161,7 +161,7 @@ def eval_object(metrics: Metrics, pred_glb: str, gt_glb: str, src_glb: str,
     tgt_f = metrics.clip_feat_img(tgt)
     clip_sims = [float((metrics.clip_feat_img(p) @ tgt_f.T).item()) for p in pred]
 
-    return {
+    out = {
         "psnr": float(np.mean(psnrs)),
         "ssim": float(np.mean(ssims)),
         "lpips": float(np.mean(lpips_pg)),
@@ -169,12 +169,29 @@ def eval_object(metrics: Metrics, pred_glb: str, gt_glb: str, src_glb: str,
         "identity_lpips": float(np.mean(ident)),
     }
 
+    # Directional CLIP ↑: does the 3D edit move in the same CLIP direction as the
+    # 2D edit?  Δ_img = CLIP(edit) − CLIP(source);  Δ_pred = CLIP(pred) − CLIP(src).
+    # cos(Δ_pred, Δ_img), mean over views. Unlike absolute CLIP this is NOT
+    # dominated by the unchanged bulk, so it can actually resolve the ablation.
+    if src_img_path and os.path.exists(src_img_path):
+        src_img = np.asarray(Image.open(src_img_path).convert("RGB"))
+        d_img = (tgt_f - metrics.clip_feat_img(src_img))
+        d_img = d_img / (d_img.norm(dim=-1, keepdim=True) + 1e-8)
+        dirs = []
+        for p, s in zip(pred, src):
+            d_pred = metrics.clip_feat_img(p) - metrics.clip_feat_img(s)
+            d_pred = d_pred / (d_pred.norm(dim=-1, keepdim=True) + 1e-8)
+            dirs.append(float((d_pred @ d_img.T).item()))
+        out["clip_dir"] = float(np.mean(dirs))
+
+    return out
+
 
 def aggregate(per_item: dict) -> dict:
-    keys = ["psnr", "ssim", "lpips", "clip_sim", "identity_lpips"]
+    keys = ["psnr", "ssim", "lpips", "clip_sim", "clip_dir", "identity_lpips"]
     agg = {}
     for k in keys:
-        vals = [v[k] for v in per_item.values()]
+        vals = [v[k] for v in per_item.values() if k in v]
         agg[k] = {"mean": float(np.mean(vals)) if vals else float("nan"),
                   "std": float(np.std(vals)) if vals else float("nan")}
     return agg
@@ -205,11 +222,12 @@ def run_mode(metrics: Metrics, results_root: str, data_root: str, mode: str,
         gt = os.path.join(data_root, uid, "tar_mesh.glb")
         src = os.path.join(data_root, uid, "src_mesh.glb")
         tgt_img = os.path.join(data_root, uid, "edit_512.png")
+        src_img = os.path.join(data_root, uid, "source.png")
         if pred is None or not (os.path.exists(gt) and os.path.exists(src) and os.path.exists(tgt_img)):
             failures.append({"uid": uid, "reason": "missing pred glb or GT files"})
             continue
         try:
-            per_item[uid] = eval_object(metrics, pred, gt, src, tgt_img)
+            per_item[uid] = eval_object(metrics, pred, gt, src, tgt_img, src_img)
             print(f"[{mode}] {uid}: " + ", ".join(f"{k}={v:.3f}" for k, v in per_item[uid].items()))
         except Exception as e:
             failures.append({"uid": uid, "reason": f"{type(e).__name__}: {e}"})
@@ -244,7 +262,7 @@ def main():
         print(f"wrote {out}  ({len(res['per_item'])} ok, {len(fails)} failed)")
 
     # comparison CSV
-    keys = ["psnr", "ssim", "lpips", "clip_sim", "identity_lpips"]
+    keys = ["psnr", "ssim", "lpips", "clip_sim", "clip_dir", "identity_lpips"]
     csv_path = os.path.join(args.results_root, f"metrics_comparison{args.out_suffix}.csv")
     with open(csv_path, "w") as f:
         f.write("metric," + ",".join(f"{m}_mean,{m}_std" for m in args.modes) + "\n")
@@ -259,7 +277,8 @@ def main():
     # terminal summary
     n = {m: len(all_results[m]["per_item"]) for m in args.modes}
     labels = {"psnr": "PSNR ↑", "ssim": "SSIM ↑", "lpips": "LPIPS ↓",
-              "clip_sim": "CLIP-Sim ↑", "identity_lpips": "Identity LPIPS ↓"}
+              "clip_sim": "CLIP-Sim ↑", "clip_dir": "CLIP-Dir ↑",
+              "identity_lpips": "Identity LPIPS ↓"}
     print("\n" + "=" * 60)
     print(f"{'metric':<18}" + "".join(f"{m:>20}" for m in args.modes))
     print("-" * 60)

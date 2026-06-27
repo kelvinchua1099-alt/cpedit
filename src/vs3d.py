@@ -148,16 +148,20 @@ class VS3DEditor:
         T = self.hp.num_steps
         return [(1.0 - k / T, 1.0 - (k + 1) / T) for k in range(T)]
 
-    def _active_schedule(self) -> List[Tuple[float, float]]:
+    def _active_schedule(self, st_step: Optional[int] = None) -> List[Tuple[float, float]]:
         """
         Active (t_curr, t_next) pairs — the LATE, low-noise steps only.
 
         Nano3D skips the first `st_step` high-noise steps and edits the rest
         (inference/sampling.py: `if num_st < st_step: continue`). st_step is
         clamped below num_steps so at least one step is always edited.
+
+        `st_step` may be overridden (e.g. masked editing opens an earlier window
+        because drift is confined to the edit region).
         """
         sched = self._full_schedule()
-        st = max(0, min(self.hp.st_step, len(sched) - 1))
+        st_val = self.hp.st_step if st_step is None else st_step
+        st = max(0, min(st_val, len(sched) - 1))
         return sched[st:]
 
     # ------------------------------------------------------------------
@@ -270,12 +274,13 @@ class VS3DEditor:
         self,
         x_src:    torch.Tensor,
         src_cond: Trellis2Condition,
+        st_step:  Optional[int] = None,
     ) -> Dict[int, torch.Tensor]:
         """
         Optimise and cache ϕ_t for each active timestep.
         Returns phi_cache: step_index → ϕ_t tensor.
         """
-        active   = self._active_schedule()
+        active   = self._active_schedule(st_step)
         phi_prev = src_cond.neg_cond.clone()
         z_edit   = x_src.clone()
         cache: Dict[int, torch.Tensor] = {}
@@ -303,10 +308,19 @@ class VS3DEditor:
         tgt_cond:   Trellis2Condition,
         phi_cache:  Dict[int, torch.Tensor],
         crop_conds: Optional[Tuple[Trellis2Condition, Trellis2Condition, float]] = None,
+        mask:       Optional[torch.Tensor] = None,
+        st_step:    Optional[int] = None,
     ) -> torch.Tensor:
         """
         FlowEdit with RASI-injected ϕ_t, PMG amplification, and optional
         crop guidance.
+
+        When `mask` ([B,1,R,R,R] ∈ [0,1] on the latent grid) is given, the
+        combined per-step velocity is gated by it before the Euler update:
+        outside the edit region the increment is ~0 so the latent stays at
+        x_src (identity preserved); inside it edits normally. This also makes
+        any crop term local (it is part of the gated combined signal) and lets
+        `st_step` open an earlier/higher-noise window safely.
 
         crop_conds = (crop_src_cond, crop_tgt_cond, crop_scale)
             When provided, each noise sample also computes a velocity difference
@@ -319,7 +333,7 @@ class VS3DEditor:
         Returns z_edit at t=0.
         """
         hp     = self.hp
-        active = self._active_schedule()
+        active = self._active_schedule(st_step)
         z_edit = x_src.clone()
 
         crop_src_cond: Optional[Trellis2Condition] = None
@@ -374,6 +388,9 @@ class VS3DEditor:
             else:
                 u = mu_S
 
+            if mask is not None:
+                u = u * mask   # region-gate the combined edit velocity
+
             z_edit = z_edit + dt * u
 
         return z_edit
@@ -382,12 +399,40 @@ class VS3DEditor:
     # Stage-1 public entry point
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
+    def probe_global_stage1(
+        self,
+        x_src:    torch.Tensor,
+        src_cond: Trellis2Condition,
+        tgt_cond: Trellis2Condition,
+        st_step:  Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Cheap un-masked, RASI-free, crop-free global FlowEdit pass used only to
+        localize the edit (B1 latent-delta mask). Returns z_edit at t=0.
+        """
+        ss_model = self.wrapper.pipeline.models["sparse_structure_flow_model"]
+        low_vram = bool(getattr(self.wrapper.pipeline, "low_vram", False))
+        if low_vram:
+            ss_model.to(self.device)
+        try:
+            return self._stage1_pmg_phase(
+                x_src, src_cond, tgt_cond, phi_cache={}, crop_conds=None,
+                mask=None, st_step=st_step,
+            )
+        finally:
+            if low_vram:
+                ss_model.cpu()
+            torch.cuda.empty_cache()
+
     def run_stage1(
         self,
         x_src:      torch.Tensor,
         src_cond:   Trellis2Condition,
         tgt_cond:   Trellis2Condition,
         crop_conds: Optional[Tuple[Trellis2Condition, Trellis2Condition, float]] = None,
+        mask:       Optional[torch.Tensor] = None,
+        st_step_override: Optional[int] = None,
     ) -> torch.Tensor:
         """
         RASI + PMG on the dense Stage-1 occupancy latent z_ss.
@@ -427,10 +472,13 @@ class VS3DEditor:
         try:
             phi_cache: Dict[int, torch.Tensor] = {}
             if self.enabled_rasi:
-                phi_cache = self._stage1_rasi_phase(x_src, src_cond)
+                phi_cache = self._stage1_rasi_phase(
+                    x_src, src_cond, st_step=st_step_override
+                )
 
             return self._stage1_pmg_phase(
-                x_src, src_cond, tgt_cond, phi_cache, crop_conds
+                x_src, src_cond, tgt_cond, phi_cache, crop_conds,
+                mask=mask, st_step=st_step_override,
             )
         finally:
             for b, p in zip(ckpt_blocks, prev_ckpt):
@@ -525,6 +573,7 @@ class VS3DEditor:
         coords_tgt: torch.Tensor,        # C_tgt voxel coords  [N_tgt, 4]
         num_steps:  int   = 25,
         guidance:   float = 10.0,        # 1 + omega_tgt  for the main forward
+        mask_at_coords: Optional[torch.Tensor] = None,  # [N_tgt] ∈ [0,1]
         **model_kwargs,
     ) -> Any:
         """
@@ -605,6 +654,12 @@ class VS3DEditor:
         p_I    = p_keep[idx_tgt].unsqueeze(-1)                   # [|I|, 1]
         gate   = (p_keep[idx_tgt] >= hp.tar_theta).float().unsqueeze(-1)  # [|I|, 1]
 
+        # Mask-gate (C2): inside the edit region (mask→1) suppress source-residual
+        # re-injection so the edit is not pulled back toward the source.
+        if mask_at_coords is not None:
+            keep = (1.0 - mask_at_coords[idx_tgt].clamp(0.0, 1.0)).unsqueeze(-1)
+            gate = gate * keep
+
         z_out_feats = z_tgt.feats.clone()
         z_out_feats[idx_tgt] = f_tgt_I + hp.tar_lambda * p_I * gate * r
 
@@ -624,6 +679,7 @@ class VS3DEditor:
         coords_tgt:      torch.Tensor,     # C_tgt  [N_tgt, 4]
         num_steps:       int   = 25,
         guidance:        float = 10.0,
+        mask_at_coords:  Optional[torch.Tensor] = None,  # [N_tgt] ∈ [0,1]
     ) -> Tuple[Any, Any]:
         """
         Run TAR for Stage 2 (geometry) and Stage 3 (material).
@@ -640,6 +696,7 @@ class VS3DEditor:
             coords_tgt=coords_tgt,
             num_steps=num_steps,
             guidance=guidance,
+            mask_at_coords=mask_at_coords,
         )
 
         # Stage 3: material is geometry-conditioned
@@ -649,6 +706,7 @@ class VS3DEditor:
             coords_tgt=coords_tgt,
             num_steps=num_steps,
             guidance=guidance,
+            mask_at_coords=mask_at_coords,
             concat_cond=z_shape,   # geometry-conditioned material pass
         )
 

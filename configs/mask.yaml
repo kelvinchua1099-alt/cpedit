@@ -1,0 +1,45 @@
+defaults:
+  - base
+
+exp_name: vs3d_mask
+
+# Automatic edit-region mask ablation arm.
+#
+# Pipeline (vs. `full`):
+#   1. one cheap global Stage-1 probe pass localizes the edit  → soft mask M on
+#      the 16³ SS latent grid  (src/mask.py: build_latent_delta_mask)
+#   2. Stage-1 edit is GATED by M, and its denoising window is OPENED earlier
+#      (masked_st_step < default st_step) — safe because drift is confined to M
+#   3. TAR source-residual re-injection is switched OFF inside M (gate_tar) so
+#      the edit is not pulled back toward the source
+#   4. crop guidance becomes local automatically (it is part of the gated signal)
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: true
+  pmg:
+    enabled: true
+    w: 1.2
+    L: 2
+  tar:
+    enabled: true
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  crop:
+    enabled: true
+    padding_scale: 1.2
+    diff_threshold: 40
+    blur_radius: 3
+    open_iter: 4
+    keep_frac: 0.15
+    guidance_scale: 0.5
+  mask:
+    enabled: true
+    threshold: 0.25        # min-max normalised latent-delta cutoff
+    dilate: 1              # voxel dilation of the binary mask
+    feather: 1.0           # soft feather (≈ Gaussian sigma)
+    probe_st_step: 12      # tight (late) window for the localization probe
+    masked_st_step: 8      # opened (earlier) window for the real masked edit
+    gate_tar: true         # suppress TAR source re-injection inside the mask
