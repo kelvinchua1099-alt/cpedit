@@ -1,0 +1,32 @@
+defaults:
+  - base
+
+# Setting B: PURE-THRESHOLD crop (single bbox), stricter threshold + tight padding
+# to reduce blank background.  Everything else identical to full.yaml so this is
+# a clean crop-localization ablation:  multi-crop+SplitFlow (full.yaml)  vs
+# pure-threshold single crop (this file)  vs  no_crop.
+exp_name: vs3d_full_pure
+
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: true
+  pmg:
+    enabled: true
+    w: 1.2
+    L: 2
+  tar:
+    enabled: true
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  crop:
+    enabled: true
+    mode: pure                # pure RGB-diff + threshold + bbox (single crop)
+    padding_scale: 1.05       # tight: minimal margin → less blank background
+    diff_threshold: 70        # stricter: keep only strong edits, tighter bbox
+    blur_radius: 3
+    bbox_percentile: 1.0      # robust bbox: 1st–99th percentile coords (drop outliers)
+    min_side_frac: 0.0
+    guidance_scale: 0.5

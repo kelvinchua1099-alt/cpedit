@@ -39,11 +39,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from PIL import Image
 
 from .asset_loader import render_asset
-from .preprocess import diff_crop_resize
+from .guidance import build_guidance
+from .preprocess import diff_crop_resize, diff_multi_crop
 from .trellis_wrapper import Trellis2Condition, TrellisWrapper
 from .vs3d import VS3DEditor
 
@@ -117,13 +119,13 @@ class EditPipeline:
             "seed":       int(self.cfg.get("seed", 42)),
         }
 
-        # ── Step 1: preprocessing ────────────────────────────────────────
-        crop_src, crop_tgt, crop_meta = self._preprocess(img_src, img_tgt)
+        # ── Step 1: preprocessing (multi-crop) ───────────────────────────
+        crops, crop_meta = self._preprocess(img_src, img_tgt)
         meta["crop"] = _jsonable(crop_meta)
 
-        if crop_meta.get("found_change"):
-            crop_src.save(os.path.join(out_dir, "crop_src.png"))
-            crop_tgt.save(os.path.join(out_dir, "crop_tgt.png"))
+        for i, (cs, ct) in enumerate(crops):
+            cs.save(os.path.join(out_dir, f"crop_src_{i}.png"))
+            ct.save(os.path.join(out_dir, f"crop_tgt_{i}.png"))
 
         # ── Step 2: generate source 3D asset ─────────────────────────────
         res          = self.cfg.model.trellis.resolution
@@ -141,16 +143,26 @@ class EditPipeline:
         #   • src_cond / tgt_cond  — always from FULL images (global signal)
         #   • crop_conds           — from cropped images + scale (extra signal)
         src_cond, tgt_cond, crop_conds = self._build_conditions(
-            img_src, img_tgt, crop_src, crop_tgt, crop_meta, res
+            img_src, img_tgt, crops, crop_meta, res
         )
-        meta["crop_guidance_active"] = crop_conds is not None
+        meta["crop_guidance_active"] = bool(crop_conds)
+        meta["n_crop_signals"] = len(crop_conds) if crop_conds else 0
 
         # ── Step 4: Stage-1 RASI + PMG ───────────────────────────────────
         x_src      = self._build_stage1_src_latent(shape_slat_src)
+        # Free VRAM for RASI's backward pass: only the SS models are needed here.
+        self.wrapper.offload_for_stage1()
         z_edit_0   = self.editor.run_stage1(
             x_src, src_cond, tgt_cond, crop_conds=crop_conds
         )
         coords_tgt = self._decode_stage1_to_coords(z_edit_0)
+        # Bring the SLAT flow models + decoders back for Stage-2/3.
+        self.wrapper.restore_all()
+        if coords_tgt.shape[0] == 0:
+            # Stage-1 produced an empty structure; fall back to the source
+            # lattice so Stage-2/3 still have coordinates to edit on.
+            coords_tgt = shape_slat_src.coords.to(coords_tgt.device).int()
+            meta["stage1_empty_fallback"] = True
         meta["n_voxels_tgt"] = int(coords_tgt.shape[0])
 
         # ── Step 5: Stage-2/3 TAR ────────────────────────────────────────
@@ -244,26 +256,49 @@ class EditPipeline:
         self,
         img_src: Image.Image,
         img_tgt: Image.Image,
-    ) -> Tuple[Image.Image, Image.Image, Dict]:
+    ) -> Tuple[List[Tuple[Image.Image, Image.Image]], Dict]:
         """
-        When crop.enabled: diff_crop_resize → zoomed crops + meta.
-        Otherwise: return original images with found_change=False.
+        When crop.enabled: diff_multi_crop → a LIST of (crop_src, crop_tgt) pairs,
+        one per significant connected edit component (top-k).  Otherwise: return
+        an empty list with found_change=False.
         """
         crop_cfg = self.cfg.editing.get("crop", {})
         if not crop_cfg.get("enabled", False):
             W, H = img_src.size
-            return img_src, img_tgt, {
-                "found_change":  False,
-                "bbox_crop":     (0, 0, W, H),
-                "original_size": (W, H),
-            }
+            return [], {"found_change": False, "n_crops": 0,
+                        "bboxes_crop": [], "original_size": (W, H)}
 
-        return diff_crop_resize(
+        mode = str(crop_cfg.get("mode", "multi")).lower()
+
+        if mode in ("pure", "single"):
+            # Pure RGB-diff + threshold + bbox (single crop), optional percentile.
+            cs, ct, m = diff_crop_resize(
+                img_src, img_tgt,
+                padding_scale   = float(crop_cfg.get("padding_scale",   1.05)),
+                diff_threshold  = int(crop_cfg.get("diff_threshold",    70)),
+                blur_radius     = int(crop_cfg.get("blur_radius",        3)),
+                min_side_frac   = float(crop_cfg.get("min_side_frac",   0.0)),
+                bbox_percentile = float(crop_cfg.get("bbox_percentile", 1.0)),
+            )
+            found = m.get("found_change", False)
+            meta = {"found_change": found, "n_crops": 1 if found else 0,
+                    "bboxes_crop": [m.get("bbox_crop")] if found else [],
+                    "bbox_diff": m.get("bbox_diff"), "original_size": m.get("original_size")}
+            return ([(cs, ct)] if found else []), meta
+
+        # Multi-crop: ALL significant connected edit components (no top-k cap),
+        # sorted largest-first so crop[0] is the main edit region.  Each becomes
+        # a velocity signal, aggregated SplitFlow-style in Stage-1.
+        return diff_multi_crop(
             img_src,
             img_tgt,
-            padding_scale  = float(crop_cfg.get("padding_scale",  1.5)),
-            diff_threshold = int(crop_cfg.get("diff_threshold",   15)),
-            blur_radius    = int(crop_cfg.get("blur_radius",       3)),
+            padding_scale    = float(crop_cfg.get("padding_scale",   1.2)),
+            diff_threshold   = int(crop_cfg.get("diff_threshold",    35)),
+            blur_radius      = int(crop_cfg.get("blur_radius",        3)),
+            top_k            = int(crop_cfg.get("top_k",              0)),   # 0 = unlimited
+            min_component    = int(crop_cfg.get("min_component",    150)),
+            morph_open_iters = int(crop_cfg.get("morph_open_iters",   2)),
+            min_side_frac    = float(crop_cfg.get("min_side_frac",  0.25)),
         )
 
     # ------------------------------------------------------------------
@@ -274,87 +309,97 @@ class EditPipeline:
         self,
         img_src:    Image.Image,
         img_tgt:    Image.Image,
-        crop_src:   Image.Image,
-        crop_tgt:   Image.Image,
+        crops:      List[Tuple[Image.Image, Image.Image]],
         crop_meta:  Dict,
         resolution: int,
     ) -> Tuple[
         Trellis2Condition,
         Trellis2Condition,
-        Optional[Tuple[Trellis2Condition, Trellis2Condition, float]],
+        Optional[List[Tuple[Trellis2Condition, Trellis2Condition, float]]],
     ]:
         """
         Returns (src_cond, tgt_cond, crop_conds).
 
-        src_cond / tgt_cond  — DINOv3 encodings of the FULL images.
-                               Always computed; used as the global edit signal.
-        crop_conds           — (crop_src_cond, crop_tgt_cond, scale) when crop is
-                               enabled AND a real change was found; else None.
-                               Provides the localized velocity difference signal.
+        src_cond / tgt_cond  — DINOv3 encodings of the FULL images (global signal).
+        crop_conds           — LIST of (crop_src_cond, crop_tgt_cond, scale), one
+                               per multi-crop component, when crop is enabled AND
+                               changes were found; else None.  Each provides a
+                               localized velocity-difference signal (mean-aggregated
+                               in Stage-1).
         """
         src_cond = self.wrapper.get_cond([img_src], resolution=resolution)
         tgt_cond = self.wrapper.get_cond([img_tgt], resolution=resolution)
 
-        crop_cfg  = self.cfg.editing.get("crop", {})
-        use_crop  = crop_cfg.get("enabled", False) and crop_meta.get("found_change", False)
-
-        if not use_crop:
+        # TwoViewGuidance decides whether the local (crop) views participate and
+        # with what weight; IdentityGuidance (no_two_view ablation) disables it.
+        guidance = build_guidance(self.cfg.editing)
+        if not guidance.enabled or not crops:
             return src_cond, tgt_cond, None
 
-        crop_scale     = float(crop_cfg.get("guidance_scale", 0.5))
-        crop_src_cond  = self.wrapper.get_cond([crop_src], resolution=resolution)
-        crop_tgt_cond  = self.wrapper.get_cond([crop_tgt], resolution=resolution)
-        return src_cond, tgt_cond, (crop_src_cond, crop_tgt_cond, crop_scale)
+        scale = guidance.scale
+        crop_conds = []
+        for (cs, ct) in crops:
+            csc = self.wrapper.get_cond([cs], resolution=resolution)
+            ctc = self.wrapper.get_cond([ct], resolution=resolution)
+            crop_conds.append((csc, ctc, scale))
+        return src_cond, tgt_cond, crop_conds
 
     # ------------------------------------------------------------------
     # Step 4 helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _infer_grid_res(shape_slat_src: Any) -> int:
+        """Detect the source SLAT lattice resolution from its coords."""
+        m = int(shape_slat_src.coords[:, 1:].max().item()) + 1
+        for r in (16, 32, 64, 128, 256):
+            if m <= r:
+                return r
+        return 256
+
     @torch.no_grad()
     def _build_stage1_src_latent(self, shape_slat_src: Any) -> torch.Tensor:
         """
-        Build x_src for Stage-1 FlowEdit.
+        Build x_src for Stage-1 FlowEdit *in the SS-VAE latent space*.
 
-        TRELLIS 2.0's sparse_structure_flow_model operates directly on binary
-        occupancy tensors [B, 1, R, R, R] — there is no separate VAE encode step.
-        x_src is the "clean data" at t=0: 1.0 for occupied voxels, 0.0 otherwise.
+        TRELLIS.2's sparse_structure_flow_model works on the latent
+        z_s ∈ [B, 8, 16, 16, 16] — NOT on raw occupancy.  We scatter the source
+        SLAT coords onto the SS VAE's native 64³ occupancy grid (rescaled from
+        the runtime-inferred source lattice) and encode:  occupancy → z_s.
         """
-        R      = _DENSE_SS_RES
+        R      = self.wrapper.ss_occ_res            # 64
         device = self.device
-        coords = shape_slat_src.coords          # [N, 4]  (batch, x, y, z)
+        coords = shape_slat_src.coords              # [N, 4]  (batch, x, y, z)
         B      = int(coords[:, 0].max().item()) + 1
 
+        self._src_grid = self._infer_grid_res(shape_slat_src)
+        scale = R / float(self._src_grid)
+
         occ = torch.zeros(B, 1, R, R, R, device=device, dtype=torch.float32)
-        b   = coords[:, 0].long()
-        x   = coords[:, 1].long().clamp(0, R - 1)
-        y   = coords[:, 2].long().clamp(0, R - 1)
-        z   = coords[:, 3].long().clamp(0, R - 1)
+        b = coords[:, 0].long()
+        x = (coords[:, 1].float() * scale).long().clamp(0, R - 1)
+        y = (coords[:, 2].float() * scale).long().clamp(0, R - 1)
+        z = (coords[:, 3].float() * scale).long().clamp(0, R - 1)
         occ[b, 0, x, y, z] = 1.0
-        return occ   # [B, 1, R, R, R]
+
+        return self.wrapper.ss_encode(occ)          # [B, 8, 16, 16, 16] float32
 
     @torch.no_grad()
-    def _decode_stage1_to_coords(
-        self,
-        z_edit_0:  torch.Tensor,
-        threshold: float = 0.5,
-    ) -> torch.Tensor:
+    def _decode_stage1_to_coords(self, z_edit_0: torch.Tensor) -> torch.Tensor:
         """
-        Decode Stage-1 flow output at t=0 → C_tgt coordinate set [N, 4].
+        Decode Stage-1 latent at t=0 → C_tgt coords [N, 4] via the SS decoder.
 
-        Tries sparse_structure_decoder first (TRELLIS 2.0 official model key);
-        falls back to direct channel-0 thresholding.
+        The decoder yields 64³ occupancy logits; we threshold and max-pool back
+        onto the source lattice (``self._src_grid``) so C_tgt lives on the same
+        grid as the source SLAT — matching TAR intersection and the SLAT decoder.
         """
-        decoder = self.wrapper.pipeline.models.get("sparse_structure_decoder")
-        if decoder is not None:
-            try:
-                out = decoder(z_edit_0)
-                if hasattr(out, "coords"):
-                    return out.coords.to(z_edit_0.device)
-            except Exception:
-                pass
-        # Fallback: threshold logit channel 0
-        active = (z_edit_0[:, 0] > threshold).nonzero()   # [N, 4]
-        return active.to(z_edit_0.device)
+        occ = self.wrapper.ss_decode(z_edit_0) > 0          # [B,1,64,64,64] bool
+        tgt = getattr(self, "_src_grid", _DENSE_SS_RES)
+        if tgt != occ.shape[-1]:
+            ratio = occ.shape[-1] // tgt
+            occ = F.max_pool3d(occ.float(), ratio, ratio) > 0.5
+        coords = torch.argwhere(occ)[:, [0, 2, 3, 4]].int()  # drop channel dim
+        return coords.to(z_edit_0.device)
 
     # ------------------------------------------------------------------
     # Step 7: save outputs
@@ -370,7 +415,7 @@ class EditPipeline:
 
         for i, mesh in enumerate(meshes):
             glb_path = os.path.join(out_dir, f"result_{i:02d}.glb")
-            mesh.export(glb_path)
+            self._export_glb(mesh, glb_path)
             meta.setdefault("glb_paths", []).append(glb_path)
 
             if save_renders:
@@ -382,6 +427,37 @@ class EditPipeline:
 
         with open(os.path.join(out_dir, "metadata.json"), "w") as f:
             json.dump(_jsonable(meta), f, indent=2)
+
+    def _export_glb(self, mesh: Any, glb_path: str) -> None:
+        """
+        Extract a textured GLB from a MeshWithVoxel.
+
+        MeshWithVoxel has no .export()/.render(); GLB extraction goes through
+        o_voxel.postprocess.to_glb (remesh + decimate + UV + PBR bake), exactly
+        as in TRELLIS.2/example.py.  Quality knobs are read from cfg.output.glb.
+        """
+        import o_voxel
+
+        gcfg = self.cfg.output.get("glb", {}) if hasattr(self.cfg.output, "get") else {}
+        decimation = int(gcfg.get("decimation_target", 300000))
+        tex_size   = int(gcfg.get("texture_size", 2048))
+
+        glb = o_voxel.postprocess.to_glb(
+            vertices          = mesh.vertices,
+            faces             = mesh.faces,
+            attr_volume       = mesh.attrs,
+            coords            = mesh.coords,
+            attr_layout       = mesh.layout,
+            voxel_size        = mesh.voxel_size,
+            aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target = decimation,
+            texture_size      = tex_size,
+            remesh            = True,
+            remesh_band       = 1,
+            remesh_project    = 0,
+            verbose           = False,
+        )
+        glb.export(glb_path, extension_webp=True)
 
     def _render_views(self, mesh: Any) -> List[Image.Image]:
         num_views  = int(self.cfg.render.get("num_views", 8))

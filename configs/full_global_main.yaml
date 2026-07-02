@@ -1,7 +1,7 @@
 defaults:
   - base
 
-exp_name: vs3d_full
+exp_name: vs3d_full_global_main
 
 editing:
   method: flowedit
@@ -19,7 +19,8 @@ editing:
     theta: 0.7
   crop:
     enabled: true
-    mode: multi               # multi-crop (connected components) + SplitFlow aggregation
+    mode: multi
+    main_direction: global   # main axis = global vΔ, not largest crop               # multi-crop (connected components) + SplitFlow aggregation
     padding_scale: 1.2        # per-crop bbox expansion
     diff_threshold: 35        # RGB-diff threshold
     blur_radius: 3

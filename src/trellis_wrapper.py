@@ -100,14 +100,79 @@ class TrellisWrapper:
     # Factory
     # ------------------------------------------------------------------
 
+    # Default SS-VAE encoder (training-time counterpart of the decoder that
+    # TRELLIS.2 already ships; non-gated).  Overridable via
+    # cfg.model.trellis.ss_encoder_ckpt.
+    _DEFAULT_SS_ENCODER = "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16"
+
     @classmethod
     def from_config(cls, cfg: DictConfig) -> "TrellisWrapper":
         """Build wrapper from Hydra / OmegaConf config (see configs/base.yaml)."""
         device   = torch.device(cfg.device)
         pipeline = Trellis2ImageTo3DPipeline.from_pretrained(cfg.model.trellis.ckpt)
+        # The custom editing code (vs3d) calls the flow models directly, bypassing
+        # the pipeline's per-op low_vram device shuffling.  Keep every model
+        # resident on-device so those direct calls don't hit CPU/GPU mismatches.
+        # Models are already .eval()'d inside Pipeline.__init__ — there is no
+        # pipeline.eval() in this build.
+        pipeline.low_vram = False
         pipeline.to(device)
-        pipeline.eval()
-        return cls(pipeline, cfg, device)
+        wrapper = cls(pipeline, cfg, device)
+        wrapper._load_ss_vae()
+        return wrapper
+
+    # ------------------------------------------------------------------
+    # Sparse-Structure VAE (Stage-1 latent space)
+    # ------------------------------------------------------------------
+
+    def _load_ss_vae(self) -> None:
+        """
+        Load the SS encoder (TRELLIS.2 ships only the SS *decoder*).  Stage-1's
+        flow model operates on the latent z_s ∈ [B, 8, 16, 16, 16]; the encoder
+        maps a 64³ occupancy grid into that latent, the decoder maps back.
+        """
+        from trellis2 import models as _t2_models
+
+        src = self.cfg.model.trellis.get("ss_encoder_ckpt", self._DEFAULT_SS_ENCODER)
+        self.ss_encoder = _t2_models.from_pretrained(src).to(self.device).eval()
+        self.ss_decoder = self.pipeline.models["sparse_structure_decoder"]
+        self.ss_occ_res = 64   # native occupancy grid of the 16l8 SS VAE
+
+    @torch.no_grad()
+    def ss_encode(self, occ: torch.Tensor) -> torch.Tensor:
+        """Occupancy [B,1,64,64,64] → latent z_s [B,8,16,16,16] (float32)."""
+        dt = next(self.ss_encoder.parameters()).dtype
+        z = self.ss_encoder(occ.to(self.device, dtype=dt))
+        return z.float()
+
+    @torch.no_grad()
+    def ss_decode(self, z_s: torch.Tensor) -> torch.Tensor:
+        """Latent z_s [B,8,16,16,16] → occupancy logits [B,1,64,64,64] (float32)."""
+        dt = next(self.ss_decoder.parameters()).dtype
+        return self.ss_decoder(z_s.to(self.device, dtype=dt)).float()
+
+    # ------------------------------------------------------------------
+    # Stage-level VRAM placement
+    # ------------------------------------------------------------------
+    # With every model resident (low_vram=False) forward editing fits in 24 GB,
+    # but RASI's *backward* pass through the SS flow model does not.  During
+    # Stage-1 only the SS models are needed, so we offload the (large) SLAT flow
+    # models + decoders to CPU, then restore them for Stage-2/3 TAR.
+
+    _SS_KEEP = ("sparse_structure_flow_model", "sparse_structure_decoder")
+
+    def offload_for_stage1(self) -> None:
+        """Keep only the SS models on-device; move the rest to CPU."""
+        for k, m in self.pipeline.models.items():
+            m.to(self.device if k in self._SS_KEEP else "cpu")
+        self.ss_encoder.to(self.device)
+        torch.cuda.empty_cache()
+
+    def restore_all(self) -> None:
+        """Move every model back on-device for the SLAT (TAR) stages."""
+        for m in self.pipeline.models.values():
+            m.to(self.device)
+        torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Conditioning

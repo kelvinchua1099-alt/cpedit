@@ -1,0 +1,33 @@
+defaults:
+  - base
+
+# Ablation: disable two-view (SplitFlow-style) guidance.
+# Crop PREPROCESSING still runs (crop_src.png / crop_tgt.png are still saved),
+# but the local crop velocity-difference is NOT fused into the Stage-1 update
+# (guidance falls back to IdentityGuidance). Only the global full-image signal
+# edits the asset. This is the control that isolates the two-view contribution
+# from the crop-preprocessing contribution (which no_crop removes entirely).
+exp_name: vs3d_no_two_view
+
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: true
+  pmg:
+    enabled: true
+    w: 1.2
+    L: 2
+  tar:
+    enabled: true
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  two_view:
+    enabled: false        # <- IdentityGuidance: crop signal not fused
+  crop:
+    enabled: true         # crop preprocessing still runs (debug images saved)
+    padding_scale: 1.5
+    diff_threshold: 15
+    blur_radius: 3
+    guidance_scale: 0.5
