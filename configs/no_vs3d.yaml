@@ -1,0 +1,31 @@
+defaults:
+  - base
+
+# Ablation: remove the VS3D editor (RASI + PMG + TAR).
+# Crop preprocessing and two-view guidance stay ON; the Stage-1 source-anchoring
+# / partial-mean guidance and the Stage-2/3 twin-agreement residual injection are
+# all disabled, so editing falls back to the bare conditional FlowEdit signal.
+exp_name: vs3d_no_vs3d
+
+editing:
+  method: flowedit
+  update_form: parallelogram
+  rasi:
+    enabled: false
+  pmg:
+    enabled: false
+    w: 1.2
+    L: 2
+  tar:
+    enabled: false
+    lam: 0.5
+    tau: 10.0
+    theta: 0.7
+  two_view:
+    enabled: true
+  crop:
+    enabled: true
+    padding_scale: 1.5
+    diff_threshold: 15
+    blur_radius: 3
+    guidance_scale: 0.5

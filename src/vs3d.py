@@ -47,6 +47,10 @@ class VS3DHyperparams:
     pmg_w: float = 1.2       # extrapolation weight w
     pmg_L: int   = 2         # partial-mean sample count L  (L < S)
 
+    # Multi-crop SplitFlow aggregation
+    crop_agg_temp: float = 0.1   # VFA softmax temperature (lower = sharper weighting)
+    crop_main_global: bool = False  # main direction = global vΔ instead of largest crop
+
     # RASI inner optimisation  (Sec. 3.2)
     rasi_K:      int   = 3
     rasi_lr:     float = 1e-5
@@ -114,6 +118,9 @@ class VS3DEditor:
             S           = ec.get("noise_samples", 5),
             pmg_w       = ec.pmg.get("w", 1.2)         if hasattr(ec, "pmg")  else 1.2,
             pmg_L       = ec.pmg.get("L", 2)           if hasattr(ec, "pmg")  else 2,
+            crop_agg_temp = ec.crop.get("agg_temp", 0.1) if hasattr(ec, "crop") else 0.1,
+            crop_main_global = (str(ec.crop.get("main_direction", "largest")).lower() == "global")
+                               if hasattr(ec, "crop") else False,
             rasi_K      = ec.rasi.get("K", 3)          if hasattr(ec, "rasi") else 3,
             rasi_lr     = ec.rasi.get("lr", 1e-5)      if hasattr(ec, "rasi") else 1e-5,
             rasi_tau_es = ec.rasi.get("tau_es", 1e-5)  if hasattr(ec, "rasi") else 1e-5,
@@ -174,6 +181,7 @@ class VS3DEditor:
         cond:  torch.Tensor,   # [B, D] positive condition
         phi:   torch.Tensor,   # [B, D] unconditional / negative embedding ϕ
         omega: float,          # CFG weight in paper notation
+        cond_no_grad: bool = False,
     ) -> torch.Tensor:
         """
         ṽ = (1+ω)*v_θ(x_t, t, cond) − ω*v_θ(x_t, t, ϕ)   [eq. 4]
@@ -185,11 +193,59 @@ class VS3DEditor:
         B = x_t.shape[0]
         t_model = torch.tensor([1000.0 * t] * B, dtype=torch.float32, device=x_t.device)
 
-        v_cond = flow_model(x_t, t_model, cond)
+        # In RASI, `cond` is the fixed source conditioning and is independent of
+        # the optimised phi, so its graph is dead weight — computing it under
+        # no_grad is numerically identical but roughly halves backward memory.
+        if cond_no_grad:
+            with torch.no_grad():
+                v_cond = flow_model(x_t, t_model, cond)
+        else:
+            v_cond = flow_model(x_t, t_model, cond)
         if omega == 0.0:
             return v_cond
         v_phi = flow_model(x_t, t_model, phi)
         return (1.0 + omega) * v_cond - omega * v_phi
+
+    # ------------------------------------------------------------------
+    # SplitFlow-style multi-crop velocity aggregation (LTP + VFA)
+    # ------------------------------------------------------------------
+
+    def _aggregate_crops(self, vdiffs: List[torch.Tensor],
+                         main_override: torch.Tensor = None) -> torch.Tensor:
+        """
+        Aggregate N crop velocity-difference fields (each [B, C, R, R, R]) into
+        one, using the SplitFlow idea:
+
+          • main direction = the LARGEST crop, vdiffs[0]  (diff_multi_crop returns
+            components sorted largest-first) — UNLESS ``main_override`` is given
+            (e.g. the global vΔ, when crop.main_direction=global), in which case
+            every crop is projected/weighted against that reference instead.
+          • LTP: project every crop's velocity onto the (per-voxel) main
+            direction, keeping only the component aligned with the main edit —
+            this enforces global consistency and suppresses conflicting pushes.
+          • VFA: weight each projected field by a per-voxel softmax over its
+            directional agreement (cosine) with the main, so aligned crops
+            dominate and disagreeing ones are down-weighted.
+
+        Returns the aggregated crop velocity [B, C, R, R, R].
+        """
+        if main_override is None and len(vdiffs) == 1:
+            return vdiffs[0]
+
+        eps = 1e-8
+        main = main_override if main_override is not None else vdiffs[0]
+        main_hat = main / main.norm(dim=1, keepdim=True).clamp(min=eps)   # [B,C,R,R,R]
+
+        projs, coss = [], []
+        for v in vdiffs:
+            dot = (v * main_hat).sum(dim=1, keepdim=True)                 # [B,1,R,R,R]
+            projs.append(dot * main_hat)                                  # LTP (∥ main)
+            coss.append(dot / v.norm(dim=1, keepdim=True).clamp(min=eps)) # cosine w/ main
+
+        P = torch.stack(projs, dim=0)                                     # [N,B,C,R,R,R]
+        C = torch.stack(coss, dim=0)                                      # [N,B,1,R,R,R]
+        w = torch.softmax(C / self.hp.crop_agg_temp, dim=0)               # VFA weights
+        return (w * P).sum(dim=0)
 
     # ------------------------------------------------------------------
     # RASI: per-step ϕ optimisation  (eq. 7, Algorithm 1 lines 4-9)
@@ -222,9 +278,12 @@ class VS3DEditor:
             eps = torch.randn_like(x_src)
             z_src_t, z_tgt_t = self._coupling(x_src, z_edit, t_curr, eps)
 
-            # Probe: both branches use c_src, but keep their real CFG weights
-            v_tgt = self._dense_cfg_velocity(z_tgt_t, t_curr, src_cond, phi, hp.omega_tgt)
-            v_src = self._dense_cfg_velocity(z_src_t, t_curr, src_cond, phi, hp.omega_src)
+            # Probe: both branches use c_src, but keep their real CFG weights.
+            # cond_no_grad drops the phi-independent cond-branch graph to fit 24 GB.
+            v_tgt = self._dense_cfg_velocity(z_tgt_t, t_curr, src_cond, phi, hp.omega_tgt,
+                                             cond_no_grad=True)
+            v_src = self._dense_cfg_velocity(z_src_t, t_curr, src_cond, phi, hp.omega_src,
+                                             cond_no_grad=True)
 
             z_reconstructed = z_edit + dt * (v_tgt - v_src)
             loss = (z_reconstructed - x_src).pow(2).mean()
@@ -264,16 +323,32 @@ class VS3DEditor:
         z_edit   = x_src.clone()
         cache: Dict[int, torch.Tensor] = {}
 
-        for idx, (t_curr, t_next) in enumerate(active):
-            with torch.enable_grad():
-                phi_t, z_edit = self._rasi_step(
-                    z_edit, x_src, t_curr, t_next,
-                    src_cond.cond, phi_prev,
-                )
-            cache[idx] = phi_t
-            phi_prev   = phi_t   # warm-start next step
+        # RASI backprops through the 1.3B SS flow model; enable gradient
+        # checkpointing for the duration so activations are recomputed in the
+        # backward pass instead of stored (fits 24 GB). Restored afterwards so
+        # the forward-only PMG phase keeps its speed.
+        self._set_ss_checkpoint(True)
+        try:
+            for idx, (t_curr, t_next) in enumerate(active):
+                with torch.enable_grad():
+                    phi_t, z_edit = self._rasi_step(
+                        z_edit, x_src, t_curr, t_next,
+                        src_cond.cond, phi_prev,
+                    )
+                cache[idx] = phi_t
+                phi_prev   = phi_t   # warm-start next step
+        finally:
+            self._set_ss_checkpoint(False)
 
         return cache
+
+    def _set_ss_checkpoint(self, flag: bool) -> None:
+        """Toggle gradient checkpointing on the sparse-structure flow model."""
+        ss_flow = self.wrapper.pipeline.models["sparse_structure_flow_model"]
+        ss_flow.use_checkpoint = flag
+        for blk in getattr(ss_flow, "blocks", []):
+            if hasattr(blk, "use_checkpoint"):
+                blk.use_checkpoint = flag
 
     # ------------------------------------------------------------------
     # Stage-1 Phase 2: PMG FlowEdit  (Algorithm 1 lines 11-20)
@@ -306,11 +381,9 @@ class VS3DEditor:
         active = self._active_schedule()
         z_edit = x_src.clone()
 
-        crop_src_cond: Optional[Trellis2Condition] = None
-        crop_tgt_cond: Optional[Trellis2Condition] = None
-        crop_scale = 0.0
-        if crop_conds is not None:
-            crop_src_cond, crop_tgt_cond, crop_scale = crop_conds
+        # crop_conds is a LIST of (crop_src_cond, crop_tgt_cond, scale), one per
+        # multi-crop component; None/empty when crop guidance is off.
+        crop_list = crop_conds or []
 
         for idx, (t_curr, t_next) in enumerate(active):
             dt = t_next - t_curr  # negative
@@ -336,15 +409,23 @@ class VS3DEditor:
                 )
                 v_delta_s = v_tgt_g - v_src_g
 
-                # Crop velocity difference  (additional local signal)
-                if crop_conds is not None:
-                    v_tgt_c = self._dense_cfg_velocity(
-                        z_tgt_t, t_curr, crop_tgt_cond.cond, phi, omega_tgt_eff
-                    )
-                    v_src_c = self._dense_cfg_velocity(
-                        z_src_t, t_curr, crop_src_cond.cond, phi, omega_src_eff
-                    )
-                    v_delta_s = v_delta_s + crop_scale * (v_tgt_c - v_src_c)
+                # Multi-crop local signals: one velocity difference per crop,
+                # aggregated SplitFlow-style (largest crop = main edit direction;
+                # others projected onto it + agreement-weighted).
+                #   v_Δ = [v_tgt(full) − v_src(full)] + scale · Agg({v_crop_i})
+                if crop_list:
+                    vdiffs = []
+                    for (csc, ctc, _cscale) in crop_list:
+                        v_tgt_c = self._dense_cfg_velocity(
+                            z_tgt_t, t_curr, ctc.cond, phi, omega_tgt_eff
+                        )
+                        v_src_c = self._dense_cfg_velocity(
+                            z_src_t, t_curr, csc.cond, phi, omega_src_eff
+                        )
+                        vdiffs.append(v_tgt_c - v_src_c)
+                    main_override = v_delta_s if self.hp.crop_main_global else None
+                    v_delta_s = v_delta_s + crop_list[0][2] * self._aggregate_crops(
+                        vdiffs, main_override=main_override)
 
                 v_delta_stack.append(v_delta_s)
 
@@ -509,9 +590,16 @@ class VS3DEditor:
         device = self.device
 
         # --- Build initial noise on C_tgt ---
+        # The tex flow model concatenates the shape SLAT onto its input, so the
+        # noise carries only the *residual* channels (in_channels − concat dims),
+        # exactly as pipeline.sample_tex_slat does.  For the shape stage there is
+        # no concat_cond and the noise spans all in_channels.
         n_tgt = coords_tgt.shape[0]
         in_ch = (self.wrapper.shape_in_channels if model == "shape"
                  else self.wrapper.tex_in_channels)
+        concat_cond = model_kwargs.get("concat_cond")
+        if concat_cond is not None:
+            in_ch -= concat_cond.feats.shape[1]
         noise_feats = torch.randn(n_tgt, in_ch, device=device, dtype=torch.float32)
         init_noise  = SparseTensor(coords=coords_tgt, feats=noise_feats)
 

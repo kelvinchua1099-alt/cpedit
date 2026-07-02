@@ -1,0 +1,11 @@
+# data & experiment outputs (large; not for the repo)
+data/
+outputs/
+
+# python caches / notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# env
+*.log

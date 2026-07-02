@@ -55,6 +55,10 @@ def diff_crop_resize(
     padding_scale: float = 1.5,
     diff_threshold: int = 15,
     blur_radius: int = 3,
+    largest_component: bool = False,
+    morph_open_iters: int = 2,
+    min_side_frac: float = 0.0,
+    bbox_percentile: float = 0.0,
 ) -> Tuple[Image.Image, Image.Image, Dict]:
     """
     通过逐像素相减定位两张图片的修改区域，裁剪出该区域并 resize 回原图尺寸。
@@ -105,6 +109,21 @@ def diff_crop_resize(
         diff_pil = diff_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     mask = np.array(diff_pil) > diff_threshold   # [H,W] bool
 
+    # ── 2b. 形态学开运算 + 取最大连通域 ──────────────────────────────────
+    #   原始 min/max bbox 很脆：几个散点（如全图轻微光照变化）就把框撑满整图。
+    #   开运算去掉散斑后，只保留「最大连通改动块」→ 真正定位到编辑区。
+    if largest_component:
+        try:
+            from scipy import ndimage
+            if morph_open_iters > 0:
+                mask = ndimage.binary_opening(mask, iterations=morph_open_iters)
+            lbl, n = ndimage.label(mask)
+            if n > 1:
+                sizes = ndimage.sum(np.ones_like(lbl), lbl, range(1, n + 1))
+                mask = lbl == (int(np.argmax(sizes)) + 1)
+        except Exception:
+            pass   # scipy missing → fall back to raw mask
+
     # ── 3. 无变化区域：直接返回原图 ──────────────────────────────────────
     ys, xs = np.where(mask)
     if len(xs) == 0:
@@ -117,8 +136,14 @@ def diff_crop_resize(
         return img_src.copy(), img_tgt.copy(), meta
 
     # ── 4. 差异紧凑框 ────────────────────────────────────────────────────
-    x1d, y1d = int(xs.min()), int(ys.min())
-    x2d, y2d = int(xs.max()), int(ys.max())
+    #   bbox_percentile>0：用百分位坐标而非绝对 min/max，扔掉离群噪点（更稳）。
+    if bbox_percentile > 0.0:
+        lo, hi = bbox_percentile, 100.0 - bbox_percentile
+        x1d, x2d = int(np.percentile(xs, lo)), int(np.percentile(xs, hi))
+        y1d, y2d = int(np.percentile(ys, lo)), int(np.percentile(ys, hi))
+    else:
+        x1d, y1d = int(xs.min()), int(ys.min())
+        x2d, y2d = int(xs.max()), int(ys.max())
     bbox_diff = (x1d, y1d, x2d, y2d)
 
     # ── 5. 以 padding_scale 向四周扩展（以差异中心为锚点） ───────────────
@@ -126,6 +151,10 @@ def diff_crop_resize(
     cy = (y1d + y2d) / 2.0
     w_half = (x2d - x1d) / 2.0 * padding_scale
     h_half = (y2d - y1d) / 2.0 * padding_scale
+    # 下限：保证裁剪框至少覆盖 min_side_frac 的边长，避免过度放大丢失上下文
+    if min_side_frac > 0.0:
+        w_half = max(w_half, min_side_frac * W / 2.0)
+        h_half = max(h_half, min_side_frac * H / 2.0)
     x1p, y1p = cx - w_half, cy - h_half
     x2p, y2p = cx + w_half, cy + h_half
 
@@ -160,3 +189,94 @@ def diff_crop_resize(
         "original_size": (W, H),
     }
     return crop_src, crop_tgt, meta
+
+
+# ---------------------------------------------------------------------------
+# Multi-crop: one crop per significant connected edit component
+# ---------------------------------------------------------------------------
+
+def _expand_and_fit_bbox(bbox_diff, W, H, padding_scale, min_side_frac=0.0):
+    """bbox_diff → padded, aspect-matched, image-fitted crop bbox (steps 5-7)."""
+    x1d, y1d, x2d, y2d = bbox_diff
+    cx = (x1d + x2d) / 2.0
+    cy = (y1d + y2d) / 2.0
+    w_half = (x2d - x1d) / 2.0 * padding_scale
+    h_half = (y2d - y1d) / 2.0 * padding_scale
+    if min_side_frac > 0.0:
+        w_half = max(w_half, min_side_frac * W / 2.0)
+        h_half = max(h_half, min_side_frac * H / 2.0)
+    x1p, y1p = cx - w_half, cy - h_half
+    x2p, y2p = cx + w_half, cy + h_half
+    ar = W / H
+    w_cur, h_cur = x2p - x1p, y2p - y1p
+    if w_cur / max(h_cur, 1e-6) > ar:
+        h_new = w_cur / ar; y1p, y2p = cy - h_new / 2.0, cy + h_new / 2.0
+    else:
+        w_new = h_cur * ar; x1p, x2p = cx - w_new / 2.0, cx + w_new / 2.0
+    return _shift_bbox_into_image(x1p, y1p, x2p, y2p, W, H)
+
+
+def diff_multi_crop(
+    img_src: Image.Image,
+    img_tgt: Image.Image,
+    padding_scale: float = 1.2,
+    diff_threshold: int = 35,
+    blur_radius: int = 3,
+    top_k: int = 0,
+    min_component: int = 150,
+    morph_open_iters: int = 2,
+    min_side_frac: float = 0.25,
+):
+    """
+    Localize edits as the top-k connected components of the 2D diff and return
+    ONE crop per component.  Handles distributed edits (e.g. many small objects
+    scattered over the object) that a single bbox cannot capture — each blob gets
+    its own zoomed crop, which becomes its own Stage-1 velocity guidance signal.
+
+    Returns
+    -------
+    crops : list of (crop_src, crop_tgt) PIL pairs (empty if no change found)
+    meta  : dict(found_change, n_crops, bboxes_crop, bboxes_diff, original_size)
+    """
+    W, H = img_src.size
+    if img_tgt.size != (W, H):
+        raise ValueError(f"size mismatch {img_src.size} vs {img_tgt.size}")
+
+    arr_src = np.array(img_src.convert("RGB"), np.float32)
+    arr_tgt = np.array(img_tgt.convert("RGB"), np.float32)
+    diff = np.abs(arr_src - arr_tgt).max(-1).astype(np.uint8)
+    dp = Image.fromarray(diff)
+    if blur_radius > 0:
+        dp = dp.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    mask = np.array(dp) > diff_threshold
+
+    order, lbl = [], None
+    try:
+        from scipy import ndimage
+        if morph_open_iters > 0:
+            mask = ndimage.binary_opening(mask, iterations=morph_open_iters)
+        lbl, n = ndimage.label(mask)
+        cnt = np.bincount(lbl.ravel())
+        order = [int(k) for k in np.argsort(cnt)[::-1] if k != 0 and cnt[k] > min_component]
+        if top_k > 0:                       # top_k<=0 → keep ALL significant components
+            order = order[:top_k]
+    except Exception:
+        order = []
+
+    crops, bboxes_crop, bboxes_diff = [], [], []
+    for k in order:
+        ys, xs = np.where(lbl == k)
+        bd = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+        bc = _expand_and_fit_bbox(bd, W, H, padding_scale, min_side_frac)
+        crops.append((img_src.crop(bc).resize((W, H), Image.BICUBIC),
+                      img_tgt.crop(bc).resize((W, H), Image.BICUBIC)))
+        bboxes_crop.append(bc); bboxes_diff.append(bd)
+
+    meta = {
+        "found_change": len(crops) > 0,
+        "n_crops":      len(crops),
+        "bboxes_crop":  bboxes_crop,
+        "bboxes_diff":  bboxes_diff,
+        "original_size": (W, H),
+    }
+    return crops, meta
