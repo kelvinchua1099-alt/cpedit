@@ -49,7 +49,6 @@ class VS3DHyperparams:
 
     # Multi-crop SplitFlow aggregation
     crop_agg_temp: float = 0.1   # VFA softmax temperature (lower = sharper weighting)
-    crop_main_global: bool = False  # main direction = global vΔ instead of largest crop
 
     # RASI inner optimisation  (Sec. 3.2)
     rasi_K:      int   = 3
@@ -119,8 +118,6 @@ class VS3DEditor:
             pmg_w       = ec.pmg.get("w", 1.2)         if hasattr(ec, "pmg")  else 1.2,
             pmg_L       = ec.pmg.get("L", 2)           if hasattr(ec, "pmg")  else 2,
             crop_agg_temp = ec.crop.get("agg_temp", 0.1) if hasattr(ec, "crop") else 0.1,
-            crop_main_global = (str(ec.crop.get("main_direction", "largest")).lower() == "global")
-                               if hasattr(ec, "crop") else False,
             rasi_K      = ec.rasi.get("K", 3)          if hasattr(ec, "rasi") else 3,
             rasi_lr     = ec.rasi.get("lr", 1e-5)      if hasattr(ec, "rasi") else 1e-5,
             rasi_tau_es = ec.rasi.get("tau_es", 1e-5)  if hasattr(ec, "rasi") else 1e-5,
@@ -210,16 +207,13 @@ class VS3DEditor:
     # SplitFlow-style multi-crop velocity aggregation (LTP + VFA)
     # ------------------------------------------------------------------
 
-    def _aggregate_crops(self, vdiffs: List[torch.Tensor],
-                         main_override: torch.Tensor = None) -> torch.Tensor:
+    def _aggregate_crops(self, vdiffs: List[torch.Tensor]) -> torch.Tensor:
         """
         Aggregate N crop velocity-difference fields (each [B, C, R, R, R]) into
         one, using the SplitFlow idea:
 
           • main direction = the LARGEST crop, vdiffs[0]  (diff_multi_crop returns
-            components sorted largest-first) — UNLESS ``main_override`` is given
-            (e.g. the global vΔ, when crop.main_direction=global), in which case
-            every crop is projected/weighted against that reference instead.
+            components sorted largest-first).
           • LTP: project every crop's velocity onto the (per-voxel) main
             direction, keeping only the component aligned with the main edit —
             this enforces global consistency and suppresses conflicting pushes.
@@ -229,11 +223,11 @@ class VS3DEditor:
 
         Returns the aggregated crop velocity [B, C, R, R, R].
         """
-        if main_override is None and len(vdiffs) == 1:
+        if len(vdiffs) == 1:
             return vdiffs[0]
 
         eps = 1e-8
-        main = main_override if main_override is not None else vdiffs[0]
+        main = vdiffs[0]
         main_hat = main / main.norm(dim=1, keepdim=True).clamp(min=eps)   # [B,C,R,R,R]
 
         projs, coss = [], []
@@ -423,9 +417,7 @@ class VS3DEditor:
                             z_src_t, t_curr, csc.cond, phi, omega_src_eff
                         )
                         vdiffs.append(v_tgt_c - v_src_c)
-                    main_override = v_delta_s if self.hp.crop_main_global else None
-                    v_delta_s = v_delta_s + crop_list[0][2] * self._aggregate_crops(
-                        vdiffs, main_override=main_override)
+                    v_delta_s = v_delta_s + crop_list[0][2] * self._aggregate_crops(vdiffs)
 
                 v_delta_stack.append(v_delta_s)
 
